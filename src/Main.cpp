@@ -1,6 +1,27 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include "ui/MainComponent.h"
 
+namespace
+{
+    class StartupScreen final : public juce::Component
+    {
+    public:
+        void paint(juce::Graphics& g) override
+        {
+            g.fillAll(juce::Colour::fromRGB(12, 13, 16));
+
+            auto area = getLocalBounds().toFloat();
+            g.setColour(juce::Colour::fromRGB(0, 229, 255));
+            g.setFont(juce::FontOptions(30.0f, juce::Font::bold));
+            g.drawText("DiscNativePro", area.removeFromTop(area.getHeight() * 0.52f), juce::Justification::centred);
+
+            g.setColour(juce::Colour::fromRGB(142, 149, 165));
+            g.setFont(juce::FontOptions(13.0f));
+            g.drawText("Iniciando la biblioteca y el audio...", area, juce::Justification::centredTop);
+        }
+    };
+}
+
 class DiscNativeProApplication : public juce::JUCEApplication
 {
 public:
@@ -59,7 +80,8 @@ public:
     {
     }
 
-    class MainWindow : public juce::DocumentWindow
+    class MainWindow : public juce::DocumentWindow,
+                       private juce::Timer
     {
     public:
         MainWindow(juce::String name)
@@ -68,17 +90,25 @@ public:
                              DocumentWindow::allButtons)
         {
             setUsingNativeTitleBar(true);
-            setContentOwned(new MainComponent(), true);
+            setContentOwned(new StartupScreen(), true);
 
            #if JUCE_IOS || JUCE_ANDROID
             setFullScreen(true);
            #else
             setResizable(true, true);
             setResizeLimits(900, 600, 3840, 2160);
-            centreWithSize(getWidth(), getHeight());
+            setSize(1360, 860);
+            centreWithSize(1360, 860);
            #endif
 
             setVisible(true);
+            startTimer(1);
+        }
+
+        void timerCallback() override
+        {
+            stopTimer();
+            setContentOwned(new MainComponent(), true);
         }
 
         void closeButtonPressed() override

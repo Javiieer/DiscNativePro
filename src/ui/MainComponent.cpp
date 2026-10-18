@@ -18,12 +18,6 @@ MainComponent::MainComponent()
       mixer(audioEngine),
       library(audioEngine.getFormatManager())
 {
-    // Start CoreAudio low-latency engine
-    audioEngine.initialise();
-
-    // Start USB MIDI Manager
-    midiManager.initialise();
-
     // Recording action (WAV export in ~/Music/DiscPro_Recordings/)
     topBar.onRecClicked = [this]() {
         juce::String outPath;
@@ -152,39 +146,47 @@ MainComponent::MainComponent()
     };
 
     // Connect MIDI hardware browser and deck loader
-    midiManager.onBrowseRotate = [this](int delta) {
-        library.navigateBrowser(delta);
-    };
-    midiManager.onBrowseClick = [this]() {
-        library.handleBrowseClick();
-    };
-    midiManager.onLoadTrack = [this](int deckIndex) {
-        library.loadSelectedTrack(deckIndex);
-    };
-    midiManager.onPlayPause = [this](int deckIndex) {
+    juce::Component::SafePointer<MainComponent> midiSafe(this);
+    midiManager.setOnBrowseRotate([midiSafe](int delta) {
+        if (midiSafe != nullptr)
+            midiSafe->library.navigateBrowser(delta);
+    });
+    midiManager.setOnBrowseClick([midiSafe]() {
+        if (midiSafe != nullptr)
+            midiSafe->library.handleBrowseClick();
+    });
+    midiManager.setOnLoadTrack([midiSafe](int deckIndex) {
+        if (midiSafe != nullptr)
+            midiSafe->library.loadSelectedTrack(deckIndex);
+    });
+    midiManager.setOnPlayPause([midiSafe](int deckIndex) {
+        if (midiSafe == nullptr)
+            return;
         if (deckIndex == 0)
         {
-            deck1.togglePlayPause();
-            midiManager.sendMidiMessage(juce::MidiMessage::noteOn(1, 11, (juce::uint8)(deck1.isPlaying() ? 127 : 0)));
+            midiSafe->deck1.togglePlayPause();
+            midiSafe->midiManager.sendMidiMessage(juce::MidiMessage::noteOn(1, 11, (juce::uint8)(midiSafe->deck1.isPlaying() ? 127 : 0)));
         }
         else
         {
-            deck2.togglePlayPause();
-            midiManager.sendMidiMessage(juce::MidiMessage::noteOn(2, 11, (juce::uint8)(deck2.isPlaying() ? 127 : 0)));
+            midiSafe->deck2.togglePlayPause();
+            midiSafe->midiManager.sendMidiMessage(juce::MidiMessage::noteOn(2, 11, (juce::uint8)(midiSafe->deck2.isPlaying() ? 127 : 0)));
         }
-    };
-    midiManager.onCue = [this](int deckIndex) {
+    });
+    midiManager.setOnCue([midiSafe](int deckIndex) {
+        if (midiSafe == nullptr)
+            return;
         if (deckIndex == 0)
         {
-            deck1.triggerCue();
-            midiManager.sendMidiMessage(juce::MidiMessage::noteOn(1, 11, (juce::uint8)0));
+            midiSafe->deck1.triggerCue();
+            midiSafe->midiManager.sendMidiMessage(juce::MidiMessage::noteOn(1, 11, (juce::uint8)0));
         }
         else
         {
-            deck2.triggerCue();
-            midiManager.sendMidiMessage(juce::MidiMessage::noteOn(2, 11, (juce::uint8)0));
+            midiSafe->deck2.triggerCue();
+            midiSafe->midiManager.sendMidiMessage(juce::MidiMessage::noteOn(2, 11, (juce::uint8)0));
         }
-    };
+    });
 
     addAndMakeVisible(library);
 
@@ -198,12 +200,23 @@ MainComponent::MainComponent()
 MainComponent::~MainComponent()
 {
     stopTimer();
+    midiManager.shutdown();
     audioEngine.shutdown();
     CoverArtGenerator::clearCache();
 }
 
 void MainComponent::timerCallback()
 {
+    if (!startupServicesInitialized)
+    {
+        startupServicesInitialized = true;
+        if (!audioEngine.initialise())
+        {
+            DBG("[MainComponent] Audio output could not be initialized; open Preferences > Devices to select an output.");
+        }
+        midiManager.initialise();
+    }
+
     if (audioEngine.isRecording())
     {
         topBar.setRecordingState(true, audioEngine.getRecordingDuration());

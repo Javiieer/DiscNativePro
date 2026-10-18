@@ -163,6 +163,7 @@ target_link_libraries(DiscNativePro
         juce::juce_audio_formats
         juce::juce_audio_processors
         juce::juce_dsp
+        juce::juce_cryptography
         juce::juce_gui_basics
         juce::juce_gui_extra
         juce::juce_recommended_config_flags
@@ -201,7 +202,8 @@ elseif(WIN32)
     include(FetchContent)
     FetchContent_Declare(
         microsoft_webview2
-        URL "https://globalcdn.nuget.org/packages/microsoft.web.webview2.1.0.1901.177.nupkg"
+        URL "https://globalcdn.nuget.org/packages/microsoft.web.webview2.1.0.2903.40.nupkg"
+        URL_HASH SHA256=EF128016DD1E51C59178C827ED5B8AA3322C57AFA8675D930F8109505542AD74
         DOWNLOAD_NAME "microsoft.web.webview2.zip"
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )

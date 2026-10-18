@@ -59,14 +59,40 @@ public:
     void applyTempoBlend(float crossfaderVal);
     void alignBeatPhase(DeckPlayer& masterDeck, DeckPlayer& slaveDeck);
 
-    double getSampleRate() const { return currentSampleRate; }
-    int getBlockSize() const     { return currentBlockSize; }
+    double getSampleRate() const { return currentSampleRate.load(); }
+    int getBlockSize() const     { return currentBlockSize.load(); }
 
     // Audio Output Channel Routing (0 = Ch 1-2, 1 = Ch 3-4)
-    void setMasterChannelPair(int pair) { masterChannelPair.store(pair); }
-    int getMasterChannelPair() const    { return masterChannelPair.load(); }
-    void setCueChannelPair(int pair)    { cueChannelPair.store(pair); }
-    int getCueChannelPair() const       { return cueChannelPair.load(); }
+    void setMasterChannelPair(int pair)
+    {
+        const int selected = pair <= 0 ? 0 : 1;
+        int routing = outputRouting.load();
+        for (;;)
+        {
+            int cuePair = (routing >> 1) & 1;
+            if (cuePair == selected)
+                cuePair = 1 - selected;
+            const int updated = selected | (cuePair << 1);
+            if (outputRouting.compare_exchange_weak(routing, updated))
+                break;
+        }
+    }
+    int getMasterChannelPair() const { return outputRouting.load() & 1; }
+    void setCueChannelPair(int pair)
+    {
+        const int selected = pair <= 0 ? 0 : 1;
+        int routing = outputRouting.load();
+        for (;;)
+        {
+            int masterPair = routing & 1;
+            if (masterPair == selected)
+                masterPair = 1 - selected;
+            const int updated = masterPair | (selected << 1);
+            if (outputRouting.compare_exchange_weak(routing, updated))
+                break;
+        }
+    }
+    int getCueChannelPair() const { return (outputRouting.load() >> 1) & 1; }
     int getNumActiveOutputChannels() const { return currentNumOutputChannels.load(); }
     bool is4ChannelOutputAvailable() const { return currentNumOutputChannels.load() >= 4; }
 
@@ -78,6 +104,8 @@ public:
     float getPitchRange() const { return deck1.getPitchRange(); }
 
 private:
+    juce::String initialiseDefaultOutputDevice();
+
     juce::AudioDeviceManager deviceManager;
     juce::TimeSliceThread diskReaderThread { "DJ Disk Streaming Thread" };
     juce::AudioFormatManager formatManager;
@@ -94,11 +122,12 @@ private:
     juce::AudioBuffer<float> masterBuffer;
     juce::AudioBuffer<float> cueBuffer;
 
-    double currentSampleRate { 44100.0 };
-    int currentBlockSize { 512 };
-    std::atomic<int> currentNumOutputChannels { 2 };
-    std::atomic<int> masterChannelPair { 0 }; // Pair 0 = Ch 1-2 (Master RCA on DDJ-SB2)
-    std::atomic<int> cueChannelPair { 1 };    // Pair 1 = Ch 3-4 (Headphones on DDJ-SB2)
+    std::atomic<double> currentSampleRate { 44100.0 };
+    std::atomic<int> currentBlockSize { 512 };
+    std::atomic<int> currentNumOutputChannels { 0 };
+    // One atomic keeps the master and cue pairs distinct and consistent.
+    // Low bit = master pair; bit 1 = cue pair. Initial route: master 0, cue 1.
+    std::atomic<int> outputRouting { 2 };
 
     std::atomic<bool> tempoBlendActive { false };
     std::atomic<float> currentCrossfaderVal { 0.0f };

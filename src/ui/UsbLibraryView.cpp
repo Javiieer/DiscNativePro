@@ -139,14 +139,12 @@ UsbLibraryView::UsbLibraryView(juce::AudioFormatManager& fm)
 
     LanguageManager::getInstance().addListener(this);
 
-    // Initial drive scan & periodic timer
-    refreshDrives();
-    startTimer(3000);
+    // Drive enumeration is deliberately deferred until the user opens this
+    // library. Construction of a hidden view must not inspect mounted volumes.
 }
 
 UsbLibraryView::~UsbLibraryView()
 {
-    stopTimer();
     LanguageManager::getInstance().removeListener(this);
 }
 
@@ -174,33 +172,12 @@ void UsbLibraryView::refreshLanguage()
     repaint();
 }
 
-void UsbLibraryView::timerCallback()
-{
-    auto currentDetected = UsbDriveScanner::getConnectedDrives();
-
-    // Check if detected drives count or paths changed
-    bool changed = (currentDetected.size() != drives.size());
-    if (!changed)
-    {
-        for (size_t i = 0; i < currentDetected.size(); ++i)
-        {
-            if (currentDetected[i].id != drives[i].id)
-            {
-                changed = true;
-                break;
-            }
-        }
-    }
-
-    if (changed)
-    {
-        refreshDrives();
-    }
-}
-
 void UsbLibraryView::refreshDrives()
 {
     auto detected = UsbDriveScanner::getConnectedDrives();
+    juce::String previousSelection;
+    if (selectedDriveIndex >= 0 && selectedDriveIndex < (int)drives.size())
+        previousSelection = drives[static_cast<size_t>(selectedDriveIndex)].id;
 
     // Preserve any custom manually opened drives
     for (const auto& d : drives)
@@ -218,6 +195,18 @@ void UsbLibraryView::refreshDrives()
     }
 
     drives = std::move(detected);
+    selectedDriveIndex = -1;
+    if (previousSelection.isNotEmpty())
+    {
+        for (size_t i = 0; i < drives.size(); ++i)
+        {
+            if (drives[i].id == previousSelection)
+            {
+                selectedDriveIndex = (int)i;
+                break;
+            }
+        }
+    }
 
     if (drives.empty())
     {
@@ -227,12 +216,19 @@ void UsbLibraryView::refreshDrives()
         availableFolders.clear();
         table.updateContent();
     }
+    else if (selectedDriveIndex < 0)
+    {
+        allUsbTracks.clear();
+        filteredUsbTracks.clear();
+        availableFolders.clear();
+        table.updateContent();
+        headerTitle.setText(LanguageManager::trUtf8("Selecciona una unidad para examinarla", "Select a drive to browse it"),
+                            juce::dontSendNotification);
+        trackCountLabel.setText({}, juce::dontSendNotification);
+    }
     else
     {
-        if (selectedDriveIndex < 0 || selectedDriveIndex >= (int)drives.size())
-        {
-            selectDrive(0);
-        }
+        filterTracks(searchBox.getText());
     }
 
     // Rebuild sidebar controls

@@ -70,7 +70,7 @@ SettingsModalComponent::SettingsModalComponent(AudioEngine& engine, MidiManager&
 SettingsModalComponent::~SettingsModalComponent()
 {
     LanguageManager::getInstance().removeListener(this);
-    midi.onMidiActivity = nullptr;
+    midi.setOnMidiActivity({});
 }
 
 void SettingsModalComponent::setActiveTab(int tabIndex)
@@ -522,7 +522,8 @@ void SettingsModalComponent::refreshLanguage()
     // Tab 5: Streaming
     streamingSectionTitle.setText(LanguageManager::trUtf8("Integración de YouTube Streaming", "YouTube Streaming Integration"), juce::dontSendNotification);
     streamingDescLabel.setText(LanguageManager::trUtf8("DiscNativePro permite buscar, mezclar y reproducir videos de YouTube en vivo directamente en las bandejas.\nPor defecto se utiliza Scraping Público para buscar sin necesidad de API Key.", "DiscNativePro lets you search, mix and play live YouTube videos directly on the decks.\nBy default, Public Scraping is used without needing an API Key."), juce::dontSendNotification);
-    apiKeyLabel.setText(LanguageManager::trUtf8("YouTube Data API v3 Key (Opcional - Para búsqueda oficial sin restricciones):", "YouTube Data API v3 Key (Optional - For official search without limits):"), juce::dontSendNotification);
+    apiKeyLabel.setText(LanguageManager::trUtf8("YouTube API Key (opcional; se guarda sin cifrar en ajustes locales):", "YouTube API key (optional; stored unencrypted in local settings):"), juce::dontSendNotification);
+    apiKeyEditor.setPasswordCharacter((juce::juce_wchar)'*');
     apiKeyEditor.setTextToShowWhenEmpty(LanguageManager::trUtf8("Pega tu clave AIzaSy...", "Paste your AIzaSy key..."), juce::Colour::fromRGB(100, 108, 125));
     clearApiKeyBtn.setText(LanguageManager::trUtf8("Borrar Key", "Clear Key"));
     apiInfoCard.setText(LanguageManager::trUtf8("Modo Video en Bandejas:\n• Al soltar un video de YouTube en el Deck 1 o Deck 2, el Jog Wheel se transforma en reproductor de video de alta definición (WebKit).\n• Los faders de volumen y el Crossfader central mezclan fluidamente el audio y video entre bandejas.\n• Iniciar sesión en YouTube en Safari comparte tu sesión con WKWebView para reproducción Premium sin publicidad.", "Video Mode in Decks:\n• Dropping a YouTube video onto Deck 1 or 2 turns the Jog Wheel into an HD video player (WebKit).\n• Volume faders and Crossfader smoothly mix audio and video between decks.\n• Logging in to YouTube in Safari shares your session with WKWebView for ad-free Premium playback."), juce::dontSendNotification);
@@ -533,7 +534,7 @@ void SettingsModalComponent::refreshLanguage()
     aiEnabledToggle.setButtonText(LanguageManager::trUtf8("Habilitar Recomendaciones Inteligentes de IA", "Enable AI Smart Recommendations"));
     aiProviderLabel.setText(LanguageManager::trUtf8("Proveedor de Inteligencia Artificial:", "AI Provider:"), juce::dontSendNotification);
     aiModelLabel.setText(LanguageManager::trUtf8("Modelo (editable: elige o pega uno nuevo):", "Model (editable: pick or paste a new one):"), juce::dontSendNotification);
-    aiApiKeyLabel.setText(LanguageManager::trUtf8("Clave API (API Key) del Proveedor Seleccionado:", "API Key for Selected Provider:"), juce::dontSendNotification);
+    aiApiKeyLabel.setText(LanguageManager::trUtf8("Clave API (se guarda sin cifrar en ajustes locales):", "API key (stored unencrypted in local settings):"), juce::dontSendNotification);
     aiApiKeyEditor.setTextToShowWhenEmpty(LanguageManager::trUtf8("Pega tu API Key...", "Paste your API Key..."), juce::Colour::fromRGB(100, 108, 125));
     clearAiApiKeyBtn.setText(LanguageManager::trUtf8("Borrar Key", "Clear Key"));
     aiInfoCard.setText(LanguageManager::trUtf8("Obtén tu API Key gratuita:\n• Google Gemini: aistudio.google.com (15 req/min sin costo)\n• OpenAI: platform.openai.com\n• Anthropic: console.anthropic.com\n• DeepSeek: platform.deepseek.com\n• OpenRouter: openrouter.ai (una key, 200+ modelos)", "Get your free API Key:\n• Google Gemini: aistudio.google.com (15 req/min free)\n• OpenAI: platform.openai.com\n• Anthropic: console.anthropic.com\n• DeepSeek: platform.deepseek.com\n• OpenRouter: openrouter.ai (one key, 200+ models)"), juce::dontSendNotification);
@@ -594,6 +595,7 @@ void SettingsModalComponent::setupDevicesTab()
     masterRoutingCombo.setSelectedId(audioEngine.getMasterChannelPair() == 0 ? 1 : 2, juce::dontSendNotification);
     masterRoutingCombo.onChange = [this]() {
         audioEngine.setMasterChannelPair(masterRoutingCombo.getSelectedId() == 1 ? 0 : 1);
+        cueRoutingCombo.setSelectedId(audioEngine.getCueChannelPair() == 1 ? 1 : 2, juce::dontSendNotification);
     };
     bodyContent.addChildComponent(masterRoutingCombo);
 
@@ -604,10 +606,11 @@ void SettingsModalComponent::setupDevicesTab()
     bodyContent.addChildComponent(cueRoutingLabel);
 
     cueRoutingCombo.addItem(juce::String::fromUTF8("Canales 3 & 4 (Jack Frontal Auriculares DDJ-SB2)"), 1);
-    cueRoutingCombo.addItem(juce::String::fromUTF8("Canales 1 & 2 (Salida Compartida Master)"), 2);
+    cueRoutingCombo.addItem(juce::String::fromUTF8("Canales 1 & 2 (salida secundaria)"), 2);
     cueRoutingCombo.setSelectedId(audioEngine.getCueChannelPair() == 1 ? 1 : 2, juce::dontSendNotification);
     cueRoutingCombo.onChange = [this]() {
         audioEngine.setCueChannelPair(cueRoutingCombo.getSelectedId() == 1 ? 1 : 0);
+        masterRoutingCombo.setSelectedId(audioEngine.getMasterChannelPair() == 0 ? 1 : 2, juce::dontSendNotification);
     };
     bodyContent.addChildComponent(cueRoutingCombo);
 
@@ -770,9 +773,11 @@ void SettingsModalComponent::setupMidiTab()
     midiMonitorText.setColour(juce::Label::textColourId, juce::Colour::fromRGB(0, 229, 255));
     bodyContent.addChildComponent(midiMonitorText);
 
-    midi.onMidiActivity = [this](const juce::String& desc) {
-        midiMonitorText.setText(desc, juce::dontSendNotification);
-    };
+    juce::Component::SafePointer<SettingsModalComponent> safe(this);
+    midi.setOnMidiActivity([safe](const juce::String& desc) {
+        if (safe != nullptr)
+            safe->midiMonitorText.setText(desc, juce::dontSendNotification);
+    });
 
     refreshMidiDevices();
 }
@@ -789,7 +794,7 @@ void SettingsModalComponent::setupStreamingTab()
     streamingDescLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(160, 165, 180));
     bodyContent.addChildComponent(streamingDescLabel);
 
-    apiKeyLabel.setText(juce::String::fromUTF8("YouTube Data API v3 Key (Opcional - Para búsqueda oficial sin restricciones):"), juce::dontSendNotification);
+    apiKeyLabel.setText(juce::String::fromUTF8("YouTube API Key (opcional; se guarda sin cifrar en ajustes locales):"), juce::dontSendNotification);
     apiKeyLabel.setFont(juce::FontOptions(11.0f, juce::Font::plain));
     apiKeyLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(180, 185, 200));
     bodyContent.addChildComponent(apiKeyLabel);
@@ -798,6 +803,7 @@ void SettingsModalComponent::setupStreamingTab()
     apiKeyEditor.setColour(juce::TextEditor::backgroundColourId, juce::Colour::fromRGB(17, 19, 26));
     apiKeyEditor.setColour(juce::TextEditor::textColourId, juce::Colours::white);
     apiKeyEditor.setColour(juce::TextEditor::outlineColourId, juce::Colour::fromRGB(38, 43, 58));
+    apiKeyEditor.setPasswordCharacter((juce::juce_wchar)'*');
     apiKeyEditor.setText(YouTubeService::getApiKey(), juce::dontSendNotification);
     bodyContent.addChildComponent(apiKeyEditor);
 
@@ -818,7 +824,7 @@ void SettingsModalComponent::setupStreamingTab()
     apiStatusBadge.setFont(juce::FontOptions(11.0f, juce::Font::bold));
     bodyContent.addChildComponent(apiStatusBadge);
 
-    apiInfoCard.setText(juce::String::fromUTF8("Modo Video en Bandejas:\n• Al soltar un video de YouTube en el Deck 1 o Deck 2, el Jog Wheel se transforma en reproductor de video de alta definición (WebKit).\n• Los faders de volumen y el Crossfader central mezclan fluidamente el audio y video entre bandejas.\n• Iniciar sesión en YouTube en Safari comparte tu sesión con WKWebView para reproducción Premium sin publicidad."), juce::dontSendNotification);
+    apiInfoCard.setText(juce::String::fromUTF8("Modo Video en Bandejas:\n• Al soltar un video de YouTube, el Jog Wheel se transforma en reproductor de video.\n• Los faders y el Crossfader mezclan el audio y video entre bandejas.\n• El reproductor puede guardar cookies y caché locales; la sesión de Safari no se comparte automáticamente."), juce::dontSendNotification);
     apiInfoCard.setFont(juce::FontOptions(10.0f));
     apiInfoCard.setColour(juce::Label::textColourId, juce::Colour::fromRGB(140, 145, 160));
     apiInfoCard.setJustificationType(juce::Justification::topLeft);
@@ -906,7 +912,7 @@ void SettingsModalComponent::setupAITab()
     refreshAiModelOptions();
     bodyContent.addChildComponent(aiModelCombo);
 
-    aiApiKeyLabel.setText("Clave API (API Key) del Proveedor Seleccionado:", juce::dontSendNotification);
+    aiApiKeyLabel.setText("Clave API (se guarda sin cifrar en ajustes locales):", juce::dontSendNotification);
     aiApiKeyLabel.setFont(juce::FontOptions(11.0f, juce::Font::plain));
     aiApiKeyLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(180, 185, 200));
     bodyContent.addChildComponent(aiApiKeyLabel);
@@ -1123,6 +1129,7 @@ void SettingsModalComponent::setupVersionTab()
         UpdateService::downloadAndOpenReleaseAsset(
             url,
             assetName,
+            chosen.assetSha256,
             [safeThis](float progress, const juce::String& statusText) {
                 if (safeThis == nullptr) return;
                 safeThis->downloadProgressValue = progress;
@@ -1131,7 +1138,7 @@ void SettingsModalComponent::setupVersionTab()
                     juce::dontSendNotification);
                 safeThis->downloadProgressBar.repaint();
             },
-            [safeThis](bool success, const juce::String& errMsg, const juce::File& /*file*/) {
+            [safeThis](bool success, const juce::String& errMsg, const juce::File& file) {
                 if (safeThis == nullptr) return;
                 safeThis->isDownloading = false;
                 safeThis->installVersionBtn.setEnabled(true);
@@ -1141,7 +1148,9 @@ void SettingsModalComponent::setupVersionTab()
                 {
                     safeThis->downloadProgressValue = 1.0;
                     safeThis->downloadStatusLabel.setText(
-                        LanguageManager::trUtf8("¡Descarga completada! Abriendo instalador...", "Download complete! Opening installer..."),
+                        file.existsAsFile()
+                            ? LanguageManager::trUtf8("Descarga verificada. Revisa el archivo e instálalo manualmente.", "Download verified. Review the file and install it manually.")
+                            : LanguageManager::trUtf8("Se abrió la página oficial de versiones.", "Opened the official releases page."),
                         juce::dontSendNotification);
                     safeThis->downloadStatusLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(74, 222, 128));
                 }
@@ -1365,10 +1374,18 @@ void SettingsModalComponent::updateTabVisibility()
     if (isDevices)
     {
         bool is4Ch = audioEngine.is4ChannelOutputAvailable();
-        if (is4Ch)
+        auto* activeDevice = audioEngine.getDeviceManager().getCurrentAudioDevice();
+        if (activeDevice == nullptr || audioEngine.getNumActiveOutputChannels() < 2)
         {
-            controllerDetectedBadge.setText(LanguageManager::trUtf8("● Controladora DJ 4 Canales Detectada (Master: Ch 1-2 • Auriculares: Ch 3-4)",
-                                                                    "● 4-Channel DJ Controller Detected (Master: Ch 1-2 • Headphones: Ch 3-4)"), juce::dontSendNotification);
+            controllerDetectedBadge.setText(LanguageManager::trUtf8("● No hay una salida de audio activa. Selecciona un dispositivo arriba.",
+                                                                    "● No active audio output. Select a device above."),
+                                            juce::dontSendNotification);
+            controllerDetectedBadge.setColour(juce::Label::textColourId, juce::Colour::fromRGB(251, 146, 60));
+        }
+        else if (is4Ch)
+        {
+            controllerDetectedBadge.setText(LanguageManager::trUtf8("● Salida multicanal activa (Master: Ch 1-2 • Auriculares: Ch 3-4)",
+                                                                    "● Multichannel output active (Master: Ch 1-2 • Headphones: Ch 3-4)"), juce::dontSendNotification);
             controllerDetectedBadge.setColour(juce::Label::textColourId, juce::Colour::fromRGB(74, 222, 128));
         }
         else

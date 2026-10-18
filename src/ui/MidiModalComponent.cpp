@@ -32,9 +32,11 @@ MidiModalComponent::MidiModalComponent(MidiManager& midiMgr)
     addAndMakeVisible(monitorText);
 
     // Live listener for incoming MIDI messages
-    midi.onMidiActivity = [this](const juce::String& desc) {
-        monitorText.setText(desc, juce::dontSendNotification);
-    };
+    juce::Component::SafePointer<MidiModalComponent> safe(this);
+    midi.setOnMidiActivity([safe](const juce::String& desc) {
+        if (safe != nullptr)
+            safe->monitorText.setText(desc, juce::dontSendNotification);
+    });
 
     LanguageManager::getInstance().addListener(this);
     refreshLanguage();
@@ -45,7 +47,7 @@ MidiModalComponent::MidiModalComponent(MidiManager& midiMgr)
 MidiModalComponent::~MidiModalComponent()
 {
     LanguageManager::getInstance().removeListener(this);
-    midi.onMidiActivity = nullptr;
+    midi.setOnMidiActivity({});
 }
 
 void MidiModalComponent::languageChanged()

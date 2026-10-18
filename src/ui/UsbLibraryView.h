@@ -12,7 +12,6 @@
 
 class UsbLibraryView : public juce::Component,
                        public juce::TableListBoxModel,
-                       public juce::Timer,
                        public LanguageManager::Listener
 {
 public:
@@ -21,7 +20,6 @@ public:
 
     void paint(juce::Graphics& g) override;
     void resized() override;
-    void timerCallback() override;
     void languageChanged() override;
     void refreshLanguage();
 

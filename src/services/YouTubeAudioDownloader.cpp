@@ -1,6 +1,165 @@
 #include "YouTubeAudioDownloader.h"
 #include "YouTubeService.h"
 #include "LanguageManager.h"
+#include <juce_cryptography/juce_cryptography.h>
+
+namespace
+{
+constexpr const char* kYtDlpLatestReleaseApi =
+    "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+constexpr juce::int64 kMaxYtDlpDownloadBytes = 100LL * 1024LL * 1024LL;
+
+std::mutex ytDlpInstallMutex;
+
+juce::String getYtDlpAssetName()
+{
+#if JUCE_WINDOWS
+    return "yt-dlp.exe";
+#elif JUCE_MAC
+    return "yt-dlp_macos";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return "yt-dlp_linux_aarch64";
+#else
+    return "yt-dlp_linux";
+#endif
+}
+
+juce::File getManagedYtDlpFile()
+{
+    auto appData = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                       .getChildFile("DiscNativePro/bin");
+    return appData.getChildFile(JUCE_WINDOWS ? "yt-dlp.exe" : "yt-dlp");
+}
+
+bool isValidYouTubeVideoId(const juce::String& id)
+{
+    return id.length() == 11 && id.containsOnly("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-");
+}
+
+juce::String readStreamBounded(juce::InputStream& stream, juce::int64 maxBytes)
+{
+    juce::MemoryOutputStream output;
+    char buffer[8192];
+    while (!stream.isExhausted())
+    {
+        const int count = stream.read(buffer, (int)sizeof(buffer));
+        if (count <= 0)
+            break;
+        if (output.getDataSize() + (size_t)count > (size_t)maxBytes)
+            return {};
+        output.write(buffer, (size_t)count);
+    }
+    return output.toString();
+}
+
+bool installVerifiedYtDlp()
+{
+    const std::lock_guard<std::mutex> installLock(ytDlpInstallMutex);
+    auto targetFile = getManagedYtDlpFile();
+    if (targetFile.existsAsFile() && targetFile.getSize() > 1000000)
+        return true;
+
+    auto targetDir = targetFile.getParentDirectory();
+    if (!targetDir.createDirectory().wasOk())
+        return false;
+
+    juce::URL apiUrl(kYtDlpLatestReleaseApi);
+    std::unique_ptr<juce::InputStream> apiStream(apiUrl.createInputStream(
+        juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+            .withConnectionTimeoutMs(10000)
+            .withNumRedirectsToFollow(0)
+            .withExtraHeaders("User-Agent: DiscNativePro-yt-dlp\n"
+                              "Accept: application/vnd.github+json\r\n")));
+    if (apiStream == nullptr)
+        return false;
+
+    auto releaseJson = juce::JSON::parse(readStreamBounded(*apiStream, 2 * 1024 * 1024));
+    if (!releaseJson.isObject())
+        return false;
+
+    const auto expectedAsset = getYtDlpAssetName();
+    juce::String downloadUrl;
+    juce::String expectedDigest;
+    if (auto* assets = releaseJson["assets"].getArray())
+    {
+        for (const auto& asset : *assets)
+        {
+            if (asset["name"].toString() == expectedAsset)
+            {
+                downloadUrl = asset["browser_download_url"].toString().trim();
+                expectedDigest = asset["digest"].toString().trim().toLowerCase();
+                break;
+            }
+        }
+    }
+
+    if (!downloadUrl.startsWithIgnoreCase("https://github.com/yt-dlp/yt-dlp/releases/download/")
+        || !downloadUrl.endsWithIgnoreCase("/" + expectedAsset)
+        || !expectedDigest.startsWith("sha256:"))
+        return false;
+
+    expectedDigest = expectedDigest.substring(7);
+    if (expectedDigest.length() != 64 || !expectedDigest.containsOnly("0123456789abcdef"))
+        return false;
+
+    juce::URL binaryUrl(downloadUrl);
+    std::unique_ptr<juce::InputStream> binaryStream(binaryUrl.createInputStream(
+        juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+            .withConnectionTimeoutMs(20000)
+            .withNumRedirectsToFollow(5)
+            .withExtraHeaders("User-Agent: DiscNativePro-yt-dlp\r\n"
+                              "Accept: application/octet-stream\r\n")));
+    if (binaryStream == nullptr)
+        return false;
+
+    const auto totalLength = binaryStream->getTotalLength();
+    if (totalLength > kMaxYtDlpDownloadBytes)
+        return false;
+
+    auto tempFile = targetDir.getNonexistentChildFile("yt-dlp", ".download", false);
+    std::unique_ptr<juce::FileOutputStream> output(tempFile.createOutputStream());
+    if (output == nullptr || !output->openedOk())
+        return false;
+
+    juce::HeapBlock<char> buffer(64 * 1024);
+    juce::int64 bytesWritten = 0;
+    bool failed = false;
+    while (!binaryStream->isExhausted())
+    {
+        const int count = binaryStream->read(buffer.get(), 64 * 1024);
+        if (count <= 0)
+            break;
+        if (bytesWritten + count > kMaxYtDlpDownloadBytes
+            || !output->write(buffer.get(), (size_t)count))
+        {
+            failed = true;
+            break;
+        }
+        bytesWritten += count;
+    }
+    output->flush();
+    output.reset();
+
+    bool valid = !failed && bytesWritten > 1000000 && tempFile.existsAsFile()
+              && tempFile.getSize() == bytesWritten
+              && (totalLength <= 0 || totalLength == bytesWritten)
+              && juce::SHA256(tempFile).toHexString().equalsIgnoreCase(expectedDigest);
+#if !JUCE_WINDOWS
+    if (valid)
+        valid = tempFile.setExecutePermission(true);
+#endif
+
+    if (valid)
+    {
+        targetFile.deleteFile();
+        valid = tempFile.moveFileTo(targetFile);
+    }
+
+    if (!valid)
+        tempFile.deleteFile();
+    return valid;
+}
+} // namespace
 
 YouTubeAudioDownloader& YouTubeAudioDownloader::getInstance()
 {
@@ -54,35 +213,43 @@ bool YouTubeAudioDownloader::isDownloading(const juce::String& videoId) const
 
 juce::String YouTubeAudioDownloader::getBinaryPath() const
 {
-    // 1. User Application Support bin directory
-    auto userAppDir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
-    auto appSupportBin = userAppDir.getChildFile("Application Support/DiscNativePro/bin/yt-dlp");
-    if (appSupportBin.existsAsFile() && appSupportBin.hasWriteAccess())
-        return appSupportBin.getFullPathName();
+    const auto managedBinary = getManagedYtDlpFile();
+    if (managedBinary.existsAsFile() && managedBinary.getSize() > 1000000)
+        return managedBinary.getFullPathName();
 
-    // 2. DiscNativePro.app/Contents/Resources/yt-dlp (bundled)
+#if JUCE_MAC
+    // DiscNativePro.app/Contents/Resources/yt-dlp (bundled)
     auto exeFile = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
     auto bundleRes = exeFile.getParentDirectory().getParentDirectory().getChildFile("Resources/yt-dlp");
     if (bundleRes.existsAsFile())
         return bundleRes.getFullPathName();
 
-    // 3. Homebrew Apple Silicon
+    // Homebrew Apple Silicon and Intel
     juce::File brewArm("/opt/homebrew/bin/yt-dlp");
     if (brewArm.existsAsFile())
         return brewArm.getFullPathName();
-
-    // 4. Homebrew Intel
     juce::File brewIntel("/usr/local/bin/yt-dlp");
     if (brewIntel.existsAsFile())
         return brewIntel.getFullPathName();
-
-    // 5. Check PATH using which
-    juce::ChildProcess whichProc;
-    if (whichProc.start("which yt-dlp"))
+#elif JUCE_LINUX
+    for (const auto& path : { "/usr/bin/yt-dlp", "/usr/local/bin/yt-dlp" })
     {
-        auto out = whichProc.readAllProcessOutput().trim();
-        if (out.isNotEmpty() && juce::File(out).existsAsFile())
-            return out;
+        juce::File candidate(path);
+        if (candidate.existsAsFile())
+            return candidate.getFullPathName();
+    }
+#endif
+
+    // Search PATH as directories instead of invoking a shell.
+    const auto pathValue = juce::SystemStats::getEnvironmentVariable("PATH", {});
+    juce::StringArray pathDirectories;
+    pathDirectories.addTokens(pathValue, JUCE_WINDOWS ? ";" : ":", "\"");
+    const auto binaryName = getYtDlpAssetName();
+    for (const auto& directory : pathDirectories)
+    {
+        auto candidate = juce::File(directory.trim()).getChildFile(binaryName);
+        if (candidate.existsAsFile())
+            return candidate.getFullPathName();
     }
 
     return {};
@@ -99,21 +266,7 @@ void YouTubeAudioDownloader::ensureBinaryInstalledAsync(std::function<void(bool 
             return;
         }
 
-        auto userAppDir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
-        auto targetDir = userAppDir.getChildFile("Application Support/DiscNativePro/bin");
-        targetDir.createDirectory();
-
-        auto targetFile = targetDir.getChildFile("yt-dlp");
-        juce::String downloadCmd = "curl -sL \"https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos\" -o \""
-                                 + targetFile.getFullPathName() + "\" && chmod +x \"" + targetFile.getFullPathName() + "\"";
-
-        juce::ChildProcess proc;
-        bool ok = proc.start(downloadCmd);
-        if (ok)
-        {
-            proc.waitForProcessToFinish(60000);
-            ok = (proc.getExitCode() == 0 && targetFile.existsAsFile() && targetFile.getSize() > 1000000);
-        }
+        const bool ok = installVerifiedYtDlp();
 
         if (onDone)
             juce::MessageManager::callAsync([onDone, ok]() { onDone(ok); });
@@ -143,7 +296,7 @@ void YouTubeAudioDownloader::downloadAudioAsync(const juce::String& videoId,
                                                 ProgressCallback onProgress,
                                                 CompletionCallback onComplete)
 {
-    if (videoId.isEmpty())
+    if (!isValidYouTubeVideoId(videoId))
     {
         if (onComplete)
             juce::MessageManager::callAsync([onComplete]() {
@@ -172,6 +325,14 @@ void YouTubeAudioDownloader::downloadAudioAsync(const juce::String& videoId,
     auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
     {
         const std::lock_guard<std::mutex> lock(mutex);
+        if (activeDownloads.find(videoId.toStdString()) != activeDownloads.end())
+        {
+            if (onComplete)
+                juce::MessageManager::callAsync([onComplete]() {
+                    onComplete({}, false, LanguageManager::trUtf8("La descarga de este video ya está en curso", "This video is already downloading"));
+                });
+            return;
+        }
         activeDownloads.insert(videoId.toStdString());
         cancelFlags[videoId.toStdString()] = cancelFlag;
     }
@@ -181,12 +342,6 @@ void YouTubeAudioDownloader::downloadAudioAsync(const juce::String& videoId,
         auto binPath = getBinaryPath();
         if (binPath.isEmpty())
         {
-            // Auto-install binary if missing
-            auto userAppDir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
-            auto targetDir = userAppDir.getChildFile("Application Support/DiscNativePro/bin");
-            targetDir.createDirectory();
-            auto targetFile = targetDir.getChildFile("yt-dlp");
-
             if (onProgress)
             {
                 juce::MessageManager::callAsync([onProgress]() {
@@ -194,13 +349,7 @@ void YouTubeAudioDownloader::downloadAudioAsync(const juce::String& videoId,
                 });
             }
 
-            juce::String installCmd = "curl -sL \"https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos\" -o \""
-                                    + targetFile.getFullPathName() + "\" && chmod +x \"" + targetFile.getFullPathName() + "\"";
-            juce::ChildProcess setupProc;
-            if (setupProc.start(installCmd))
-            {
-                setupProc.waitForProcessToFinish(60000);
-            }
+            installVerifiedYtDlp();
             binPath = getBinaryPath();
         }
 

@@ -15,14 +15,19 @@ bool AudioRecorder::startRecording(const juce::File& file, double sampleRate, in
 {
     stopRecording();
 
+    if (isThreadRunning() || writer != nullptr || sampleRate <= 0.0
+        || numChannels <= 0 || numChannels > fifoBuffer.getNumChannels())
+        return false;
+
     currentRecordFile = file;
     currentSampleRate = sampleRate;
     channels = numChannels;
     totalRecordedSamples.store(0);
+    droppedSamples.store(0);
     durationSeconds.store(0.0);
 
     if (currentRecordFile.exists())
-        currentRecordFile.deleteFile();
+        return false;
 
     auto outStream = currentRecordFile.createOutputStream();
     if (outStream == nullptr)
@@ -37,22 +42,40 @@ bool AudioRecorder::startRecording(const juce::File& file, double sampleRate, in
                                            0));
 
     if (writer == nullptr)
+    {
+        currentRecordFile.deleteFile();
         return false;
+    }
 
     fifo.reset();
     fifoBuffer.clear();
-    recording.store(true);
-
-    startThread(juce::Thread::Priority::normal);
+    if (!startThread(juce::Thread::Priority::normal))
+    {
+        writer.reset();
+        currentRecordFile.deleteFile();
+        return false;
+    }
+    recording.store(true, std::memory_order_release);
     return true;
 }
 
 void AudioRecorder::stopRecording()
 {
-    if (recording.exchange(false))
-    {
+    const bool wasRecording = recording.exchange(false, std::memory_order_acq_rel);
+    if (wasRecording)
         wakeEvent.signal();
-        stopThread(3000);
+
+    while (activePushes.load(std::memory_order_acquire) != 0)
+        juce::Thread::sleep(1);
+
+    if (isThreadRunning() && !stopThread(3000))
+    {
+        DBG("AudioRecorder: worker did not stop before timeout; writer kept alive.");
+        return;
+    }
+
+    if (writer != nullptr)
+    {
         flushRemainingBuffer();
         writer.reset();
     }
@@ -60,7 +83,18 @@ void AudioRecorder::stopRecording()
 
 void AudioRecorder::pushAudioBlock(const juce::AudioBuffer<float>& buffer, int numSamples)
 {
-    if (!recording.load(std::memory_order_relaxed) || numSamples <= 0)
+    activePushes.fetch_add(1, std::memory_order_acquire);
+    struct PushGuard
+    {
+        std::atomic<int>& counter;
+        ~PushGuard() { counter.fetch_sub(1, std::memory_order_release); }
+    } guard { activePushes };
+
+    if (!recording.load(std::memory_order_acquire) || numSamples <= 0)
+        return;
+
+    numSamples = juce::jmin(numSamples, buffer.getNumSamples());
+    if (numSamples <= 0)
         return;
 
     int start1, size1, start2, size2;
@@ -82,8 +116,13 @@ void AudioRecorder::pushAudioBlock(const juce::AudioBuffer<float>& buffer, int n
 
     fifo.finishedWrite(size1 + size2);
 
-    int64_t total = totalRecordedSamples.fetch_add(numSamples, std::memory_order_relaxed) + numSamples;
-    durationSeconds.store((double)total / currentSampleRate, std::memory_order_relaxed);
+    const int acceptedSamples = size1 + size2;
+    const int dropped = numSamples - acceptedSamples;
+    if (dropped > 0)
+        droppedSamples.fetch_add(dropped, std::memory_order_relaxed);
+    const int64_t total = totalRecordedSamples.fetch_add(acceptedSamples, std::memory_order_relaxed) + acceptedSamples;
+    if (currentSampleRate > 0.0)
+        durationSeconds.store((double)total / currentSampleRate, std::memory_order_relaxed);
 
     wakeEvent.signal();
 }

@@ -40,6 +40,7 @@ private:
 
     bool isFxPanelVisible { true };
     bool isSamplerPanelVisible { false };
+    bool startupServicesInitialized { false };
     juce::Component::SafePointer<juce::DialogWindow> settingsWindow;
 
     // Automix orchestration state

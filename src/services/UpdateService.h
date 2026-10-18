@@ -12,6 +12,7 @@ struct ReleaseItem
     juce::String downloadUrl;  // Asset directo para el SO actual o pageUrl
     juce::String pageUrl;      // html_url del release
     juce::String assetName;    // Nombre del archivo a descargar
+    juce::String assetSha256;  // digest SHA-256 publicado por la API de GitHub
 };
 
 // Resultado del chequeo de actualización contra GitHub Releases.
@@ -27,6 +28,7 @@ struct UpdateInfo
     juce::String downloadUrl;    // asset de esta plataforma, o html_url como fallback
     juce::String pageUrl;        // html_url del release
     juce::String assetName;
+    juce::String assetSha256;
     std::vector<ReleaseItem> allReleases; // Lista de versiones disponibles en GitHub
 };
 
@@ -39,10 +41,11 @@ public:
     // Nunca lanza: sin red, timeout, rate-limit o tag omitido => available=false.
     static void checkForUpdatesAsync(UpdateCallback onComplete);
 
-    // Descarga el asset a Descargas con progreso (0.0f - 1.0f) y lo abre/ejecuta al terminar.
+    // Descarga un asset con digest SHA-256 conocido y lo revela para instalación manual.
     static void downloadAndOpenReleaseAsset(
         const juce::String& downloadUrl,
         const juce::String& assetName,
+        const juce::String& expectedSha256,
         std::function<void(float progress, const juce::String& statusText)> onProgress,
         std::function<void(bool success, const juce::String& errorMessage, const juce::File& file)> onComplete);
 

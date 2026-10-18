@@ -1,15 +1,18 @@
 #include "YouTubeService.h"
-#include <cstdio>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <mutex>
 #include <map>
 
-#if JUCE_WINDOWS
-#define popen _popen
-#define pclose _pclose
-#endif
+namespace
+{
+bool isValidYouTubeVideoId(const juce::String& id)
+{
+    return id.length() == 11
+        && id.containsOnly("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-");
+}
+}
 
 juce::File YouTubeService::getSettingsFile()
 {
@@ -216,7 +219,8 @@ juce::String YouTubeService::extractVideoId(const juce::String& input)
         auto sub = clean.substring(vIdx + 2);
         int amp = sub.indexOfAnyOf("&?/");
         if (amp >= 0) sub = sub.substring(0, amp);
-        if (sub.length() >= 11) return sub.substring(0, 11);
+        auto id = sub.substring(0, juce::jmin(11, sub.length()));
+        if (isValidYouTubeVideoId(id)) return id;
     }
 
     // 3. Shortened youtu.be/
@@ -226,7 +230,8 @@ juce::String YouTubeService::extractVideoId(const juce::String& input)
         auto sub = clean.substring(beIdx + 9);
         int q = sub.indexOfAnyOf("?&/");
         if (q >= 0) sub = sub.substring(0, q);
-        if (sub.length() >= 11) return sub.substring(0, 11);
+        auto id = sub.substring(0, juce::jmin(11, sub.length()));
+        if (isValidYouTubeVideoId(id)) return id;
     }
 
     // 4. Shorts / Embed / Live
@@ -239,7 +244,8 @@ juce::String YouTubeService::extractVideoId(const juce::String& input)
             auto sub = clean.substring(pIdx + (int)strlen(prefix));
             int q = sub.indexOfAnyOf("?&/");
             if (q >= 0) sub = sub.substring(0, q);
-            if (sub.length() >= 11) return sub.substring(0, 11);
+            auto id = sub.substring(0, juce::jmin(11, sub.length()));
+            if (isValidYouTubeVideoId(id)) return id;
         }
     }
 
@@ -250,7 +256,7 @@ YouTubeSearchResult YouTubeService::getVideoDetails(const juce::String& videoIdO
 {
     auto vidId = extractVideoId(videoIdOrUrl);
     if (vidId.isEmpty())
-        vidId = videoIdOrUrl.trim();
+        return {};
 
     YouTubeSearchResult result;
     result.id = vidId;
@@ -288,47 +294,26 @@ namespace
 // Descarga una página de YouTube (watch o results) con la misma técnica que searchPublic
 juce::String downloadYouTubePage(const juce::String& pageUrl)
 {
-    juce::String html;
+    const juce::URL url(pageUrl);
+    if (!url.isWellFormed() || url.getDomain().toLowerCase() != "www.youtube.com"
+        || !url.toString(false).startsWithIgnoreCase("https://"))
+        return {};
 
-#if !JUCE_WINDOWS
-    juce::String cmd = "curl -s -L --max-time 6 "
-                       "-H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' "
-                       "-H 'Accept-Language: es,en-US;q=0.9,en;q=0.8' "
-                       "'" + pageUrl + "'";
-
-    FILE* pipe = popen(cmd.toRawUTF8(), "r");
-    if (pipe != nullptr)
-    {
-        char buffer[16384];
-        std::string outStr;
-        while (size_t bytes = fread(buffer, 1, sizeof(buffer), pipe))
-            outStr.append(buffer, bytes);
-        pclose(pipe);
-        html = juce::String::fromUTF8(outStr.data(), (int)outStr.size());
-    }
-#endif
-
-    if (html.isEmpty())
-    {
-        juce::URL url(pageUrl);
-        juce::String extraHeaders =
+    juce::String extraHeaders =
 #if JUCE_WINDOWS
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
 #else
-            "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
 #endif
-            "Accept-Language: es,en-US;q=0.9,en;q=0.8\r\n";
+        "Accept-Language: es,en-US;q=0.9,en;q=0.8\r\n";
 
-        std::unique_ptr<juce::InputStream> stream(url.createInputStream(
-            juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
-                .withConnectionTimeoutMs(8000)
-                .withExtraHeaders(extraHeaders)));
+    std::unique_ptr<juce::InputStream> stream(url.createInputStream(
+        juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+            .withConnectionTimeoutMs(8000)
+            .withNumRedirectsToFollow(0)
+            .withExtraHeaders(extraHeaders)));
 
-        if (stream != nullptr)
-            html = stream->readEntireStreamAsString();
-    }
-
-    return html;
+    return stream != nullptr ? stream->readEntireStreamAsString() : juce::String();
 }
 
 // Extrae el JSON de ytInitialData del HTML (misma técnica que searchPublic)
@@ -568,54 +553,24 @@ void YouTubeService::searchAsync(const juce::String& query,
 std::vector<YouTubeSearchResult> YouTubeService::searchPublic(const juce::String& query)
 {
     std::vector<YouTubeSearchResult> results;
-
-    juce::String html;
-
-#if !JUCE_WINDOWS
-    // Use curl on macOS / POSIX for ultra-fast, robust response with HTTP/2 and modern TLS
-    juce::String escapedQuery = query;
-    escapedQuery = escapedQuery.replace("'", "'\\''");
-    juce::String cmd = "curl -s -L --max-time 6 "
-                       "-H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' "
-                       "-H 'Accept-Language: es,en-US;q=0.9,en;q=0.8' "
-                       "'https://www.youtube.com/results?search_query=" + juce::URL::addEscapeChars(escapedQuery, true) + "'";
-
-    FILE* pipe = popen(cmd.toRawUTF8(), "r");
-    if (pipe != nullptr)
-    {
-        char buffer[16384];
-        std::string outStr;
-        while (size_t bytes = fread(buffer, 1, sizeof(buffer), pipe))
-        {
-            outStr.append(buffer, bytes);
-        }
-        pclose(pipe);
-        html = juce::String::fromUTF8(outStr.data(), (int)outStr.size());
-    }
-#endif
-
-    // On Windows (or fallback on macOS), use native juce::URL in-memory streaming
-    // to avoid spawning visible cmd.exe console windows
-    if (html.isEmpty())
-    {
-        juce::String urlStr = "https://www.youtube.com/results?search_query=" + juce::URL::addEscapeChars(query, true);
-        juce::URL url(urlStr);
-        juce::String extraHeaders =
+    const auto safeQuery = query.substring(0, 256);
+    const auto urlStr = "https://www.youtube.com/results?search_query=" + juce::URL::addEscapeChars(safeQuery, true);
+    const juce::URL url(urlStr);
+    juce::String extraHeaders =
 #if JUCE_WINDOWS
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n"
 #else
-            "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
+        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
 #endif
-            "Accept-Language: es,en-US;q=0.9,en;q=0.8\r\n";
+        "Accept-Language: es,en-US;q=0.9,en;q=0.8\r\n";
 
-        std::unique_ptr<juce::InputStream> stream(url.createInputStream(
-            juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
-                .withConnectionTimeoutMs(8000)
-                .withExtraHeaders(extraHeaders)));
+    std::unique_ptr<juce::InputStream> stream(url.createInputStream(
+        juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+            .withConnectionTimeoutMs(8000)
+            .withNumRedirectsToFollow(0)
+            .withExtraHeaders(extraHeaders)));
 
-        if (stream != nullptr)
-            html = stream->readEntireStreamAsString();
-    }
+    juce::String html = stream != nullptr ? stream->readEntireStreamAsString() : juce::String();
 
     if (html.isEmpty())
         return results;

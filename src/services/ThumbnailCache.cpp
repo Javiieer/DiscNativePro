@@ -1,5 +1,19 @@
 #include "ThumbnailCache.h"
 
+namespace
+{
+bool isAllowedArtworkUrl(const juce::String& value)
+{
+    const juce::URL url(value);
+    if (!url.isWellFormed() || !url.toString(false).startsWithIgnoreCase("https://"))
+        return false;
+
+    const auto domain = url.getDomain().toLowerCase();
+    return domain == "ytimg.com" || domain.endsWith(".ytimg.com")
+        || domain == "sndcdn.com" || domain.endsWith(".sndcdn.com");
+}
+}
+
 ThumbnailCache& ThumbnailCache::getInstance()
 {
     static ThumbnailCache instance;
@@ -68,6 +82,8 @@ juce::Image ThumbnailCache::getThumbnail(const juce::String& videoId,
 
     if (downloadUrl.isNotEmpty())
     {
+        if (!isAllowedArtworkUrl(downloadUrl))
+            return {};
         {
             std::scoped_lock lock(cacheMutex);
             pendingRequests.insert(key);
@@ -88,63 +104,56 @@ void ThumbnailCache::downloadAsync(const juce::String& videoId,
 
     juce::Thread::launch([this, videoId, url, safeKey, cacheFile, tmpFile, cb = std::move(onReadyCallback)]() mutable {
         bool downloadOk = false;
-
-#if !JUCE_WINDOWS
-        // Try downloading via curl on macOS / POSIX
-        juce::String escapedUrl = url;
-        escapedUrl = escapedUrl.replace("'", "'\\''");
-        juce::String cmd = "curl -s -L --max-time 6 -o '" + tmpFile.getFullPathName() + "' '" + escapedUrl + "'";
-
-        int ret = system(cmd.toRawUTF8());
-        if (ret == 0 && tmpFile.existsAsFile() && tmpFile.getSize() > 200)
-        {
-            cacheFile.deleteFile();
-            tmpFile.moveFileTo(cacheFile);
-            downloadOk = true;
-        }
-#endif
-
-        // Fallback to JUCE URL if curl failed
-        if (!downloadOk)
+        if (isAllowedArtworkUrl(url))
         {
             juce::URL juceUrl(url);
             std::unique_ptr<juce::InputStream> stream(juceUrl.createInputStream(
                 juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
-                    .withConnectionTimeoutMs(6000)));
+                    .withConnectionTimeoutMs(6000)
+                    .withNumRedirectsToFollow(0)));
 
             if (stream != nullptr)
             {
-                cacheFile.deleteFile();
-                juce::FileOutputStream fos(cacheFile);
+                tmpFile.deleteFile();
+                juce::FileOutputStream fos(tmpFile);
                 if (fos.openedOk())
                 {
-                    fos.writeFromInputStream(*stream, -1);
+                    constexpr juce::int64 maxImageBytes = 10 * 1024 * 1024;
+                    char buffer[8192];
+                    juce::int64 bytesWritten = 0;
+                    while (!stream->isExhausted() && bytesWritten <= maxImageBytes)
+                    {
+                        const int bytesRead = stream->read(buffer, (int)sizeof(buffer));
+                        if (bytesRead <= 0)
+                            break;
+                        if (bytesWritten + bytesRead > maxImageBytes)
+                        {
+                            bytesWritten = maxImageBytes + 1;
+                            break;
+                        }
+                        fos.write(buffer, (size_t)bytesRead);
+                        bytesWritten += bytesRead;
+                    }
                     fos.flush();
-                    downloadOk = (cacheFile.existsAsFile() && cacheFile.getSize() > 200);
+                    downloadOk = bytesWritten > 200 && bytesWritten <= maxImageBytes;
                 }
             }
         }
 
         juce::Image finalImg;
-        if (cacheFile.existsAsFile())
+        if (downloadOk && tmpFile.existsAsFile())
         {
-            auto rawImg = juce::ImageFileFormat::loadFrom(cacheFile);
-            if (!rawImg.isValid())
-            {
-#if JUCE_MAC
-                // Fallback: convert via macOS sips in case server sent WebP
-                juce::String sipsCmd = "sips -s format jpeg '" + cacheFile.getFullPathName() + "' --out '" + cacheFile.getFullPathName() + "' 2>/dev/null";
-                system(sipsCmd.toRawUTF8());
-                rawImg = juce::ImageFileFormat::loadFrom(cacheFile);
-#endif
-            }
+            auto rawImg = juce::ImageFileFormat::loadFrom(tmpFile);
 
             if (rawImg.isValid())
             {
                 auto scaled = rawImg.rescaled(160, 90, juce::Graphics::mediumResamplingQuality);
                 finalImg = scaled.isValid() ? scaled : rawImg;
+                cacheFile.deleteFile();
+                tmpFile.moveFileTo(cacheFile);
             }
         }
+        tmpFile.deleteFile();
 
         juce::MessageManager::callAsync([this, safeKey, videoId, finalImg, readyCb = std::move(cb)]() {
             std::string key = safeKey.toStdString();

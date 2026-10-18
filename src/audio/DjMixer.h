@@ -30,6 +30,15 @@ struct ChannelStrip
     juce::dsp::IIR::Filter<float> highFilter[2];
     juce::dsp::IIR::Filter<float> colorFilter[2];
 
+    // Precomputed coefficient tables: the audio callback only selects a cached
+    // coefficient set and never allocates IIR objects while processing audio.
+    using CoefficientsPtr = juce::ReferenceCountedObjectPtr<juce::dsp::IIR::Coefficients<float>>;
+    std::vector<CoefficientsPtr> lowEqCoefficients;
+    std::vector<CoefficientsPtr> midEqCoefficients;
+    std::vector<CoefficientsPtr> highEqCoefficients;
+    std::vector<CoefficientsPtr> colorLowPassCoefficients;
+    std::vector<CoefficientsPtr> colorHighPassCoefficients;
+
     void prepare(double sampleRate, int blockSize);
     void reset();
     void process(juce::AudioBuffer<float>& buffer, int numSamples, double sampleRate);

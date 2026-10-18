@@ -8,10 +8,12 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <atomic>
+#include <memory>
 
 struct SamplerSlot
 {
-    juce::AudioBuffer<float> sample; // estéreo, device-rate
+    std::atomic<juce::AudioBuffer<float>*> sample { nullptr }; // immutable while published
+    std::atomic<int> sampleLength { 0 };
     std::atomic<int> readPos { 0 };
     std::atomic<bool> playing { false };
     juce::String name;
@@ -24,7 +26,7 @@ public:
     static constexpr double maxSampleSeconds = 30.0;
 
     SamplerBank() = default;
-    ~SamplerBank() = default;
+    ~SamplerBank();
 
     // Hilo UI. Devuelve false si el archivo no se pudo decodificar.
     bool loadSlot(int index, const juce::File& file,
@@ -46,11 +48,12 @@ public:
     void process(juce::AudioBuffer<float>& master, int numSamples);
 
 private:
-    void freeSlot(int index); // playing=false + espera + libera (hilo UI)
+    void freeSlot(int index); // swaps ownership off the audio thread
 
     SamplerSlot slots[numSlots];
+    std::atomic<int> activeReaders { 0 };
     std::atomic<float> masterVolume { 0.8f };
-    double lastDeviceSr { 48000.0 };
+    std::atomic<double> lastDeviceSr { 48000.0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SamplerBank)
 };

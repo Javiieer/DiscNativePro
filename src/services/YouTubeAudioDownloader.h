@@ -24,10 +24,10 @@ public:
     // Checks if a specific track is currently being downloaded
     bool isDownloading(const juce::String& videoId) const;
 
-    // Locates the yt-dlp binary (App Support, Bundle Resources, Homebrew, PATH)
+    // Locates the verified app-managed yt-dlp binary or a user-installed binary.
     juce::String getBinaryPath() const;
 
-    // Ensures binary is installed; if missing, downloads the standalone binary async
+    // Ensures a platform-specific upstream binary is installed after SHA-256 verification.
     void ensureBinaryInstalledAsync(std::function<void(bool success)> onDone = nullptr);
 
     // Downloads YouTube audio in background

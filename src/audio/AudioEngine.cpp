@@ -24,30 +24,68 @@ bool AudioEngine::initialise()
     isShuttingDown.store(false);
 
     // Start background disk streaming thread (priority normal for smooth file prefetching)
-    diskReaderThread.startThread(juce::Thread::Priority::normal);
-
-    // Initialise audio device manager with 0 inputs, up to 4 outputs (Master Ch 1-2, Phones Ch 3-4)
-    auto err = deviceManager.initialiseWithDefaultDevices(0, 4);
-    if (!err.isEmpty())
+    if (!diskReaderThread.startThread(juce::Thread::Priority::normal))
     {
-        DBG("Audio device error: " << err);
+        DBG("Could not start the disk reader thread");
         return false;
     }
 
-    // Ensure all available physical output channels (up to 4) are activated
-    auto setup = deviceManager.getAudioDeviceSetup();
-    if (auto* currentDev = deviceManager.getCurrentAudioDevice())
+    // Start with a safe stereo pair. Some drivers reject a four-channel request
+    // even though their normal stereo output is available.
+    auto err = initialiseDefaultOutputDevice();
+    if (!err.isEmpty())
     {
-        auto outNames = currentDev->getOutputChannelNames();
-        int numAvail = outNames.size();
-        currentNumOutputChannels.store(numAvail);
-        setup.outputChannels.setRange(0, juce::jmin(4, numAvail), true);
-        deviceManager.setAudioDeviceSetup(setup, true);
+        DBG("Audio device error: " << err);
+        diskReaderThread.stopThread(-1);
+        return false;
     }
 
     deviceManager.addAudioCallback(this);
     deviceManager.addChangeListener(this);
     return true;
+}
+
+juce::String AudioEngine::initialiseDefaultOutputDevice()
+{
+    currentNumOutputChannels.store(0);
+
+    auto error = deviceManager.initialiseWithDefaultDevices(0, 2);
+    if (error.isNotEmpty())
+        return error;
+
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (device == nullptr)
+        return "No default audio output device is available.";
+
+    auto availableOutputs = device->getOutputChannelNames().size();
+    if (availableOutputs >= 4)
+    {
+        auto stereoSetup = deviceManager.getAudioDeviceSetup();
+        auto fourChannelSetup = stereoSetup;
+        fourChannelSetup.outputChannels.clear();
+        fourChannelSetup.outputChannels.setRange(0, 4, true);
+
+        auto fourChannelError = deviceManager.setAudioDeviceSetup(fourChannelSetup, true);
+        if (fourChannelError.isNotEmpty())
+        {
+            DBG("[AudioEngine] Four-channel output was rejected; keeping stereo: " << fourChannelError);
+            auto stereoError = deviceManager.setAudioDeviceSetup(stereoSetup, true);
+            if (stereoError.isNotEmpty())
+                return "Could not restore stereo output after four-channel setup failed: " + stereoError;
+        }
+    }
+
+    device = deviceManager.getCurrentAudioDevice();
+    if (device == nullptr)
+        return "The audio device closed while its output channels were being configured.";
+
+    const int activeChannels = device->getActiveOutputChannels().countNumberOfSetBits();
+    currentNumOutputChannels.store(activeChannels);
+    if (activeChannels < 2)
+        return "The selected audio device has fewer than two active output channels.";
+
+    DBG("[AudioEngine] Active output channels: " << activeChannels << " on " << device->getName());
+    return {};
 }
 
 void AudioEngine::shutdown()
@@ -58,7 +96,9 @@ void AudioEngine::shutdown()
     deviceManager.removeChangeListener(this);
     deviceManager.removeAudioCallback(this);
     deviceManager.closeAudioDevice();
-    diskReaderThread.stopThread(2000);
+    // Deck sources depend on this thread. Wait for a clean exit rather than
+    // allowing JUCE to force-kill it while a source could still be using them.
+    diskReaderThread.stopThread(-1);
 }
 
 juce::File AudioEngine::getSettingsFile()
@@ -137,7 +177,7 @@ bool AudioEngine::toggleRecording(juce::String& outFilePath)
     auto timestamp = juce::Time::getCurrentTime().formatted("%Y-%m-%d_%H%M%S");
     auto recFile = recDir.getChildFile("DiscPro_Mix_" + timestamp + ".wav");
 
-    bool success = audioRecorder.startRecording(recFile, currentSampleRate, 2);
+    bool success = audioRecorder.startRecording(recFile, currentSampleRate.load(), 2);
     if (success)
     {
         outFilePath = recFile.getFullPathName();
@@ -152,23 +192,26 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     if (device == nullptr)
         return;
 
-    currentSampleRate = device->getCurrentSampleRate();
-    currentBlockSize = device->getCurrentBufferSizeSamples();
+    const double sampleRate = device->getCurrentSampleRate();
+    const int blockSize = device->getCurrentBufferSizeSamples();
+    currentSampleRate.store(sampleRate);
+    currentBlockSize.store(blockSize);
     currentNumOutputChannels.store(device->getActiveOutputChannels().countNumberOfSetBits());
 
     // Preallocate buffers for zero runtime heap allocation (real-time safe)
-    deck1Buffer.setSize(2, currentBlockSize, false, true, true);
-    deck2Buffer.setSize(2, currentBlockSize, false, true, true);
-    masterBuffer.setSize(2, currentBlockSize, false, true, true);
-    cueBuffer.setSize(2, currentBlockSize, false, true, true);
+    deck1Buffer.setSize(2, blockSize, false, true, true);
+    deck2Buffer.setSize(2, blockSize, false, true, true);
+    masterBuffer.setSize(2, blockSize, false, true, true);
+    cueBuffer.setSize(2, blockSize, false, true, true);
 
-    deck1.prepareToPlay(currentBlockSize, currentSampleRate);
-    deck2.prepareToPlay(currentBlockSize, currentSampleRate);
-    djMixer.prepare(currentSampleRate, currentBlockSize);
+    deck1.prepareToPlay(blockSize, sampleRate);
+    deck2.prepareToPlay(blockSize, sampleRate);
+    djMixer.prepare(sampleRate, blockSize);
 }
 
 void AudioEngine::audioDeviceStopped()
 {
+    currentNumOutputChannels.store(0);
     audioRecorder.stopRecording();
     deck1.releaseResources();
     deck2.releaseResources();
@@ -227,19 +270,11 @@ bool AudioEngine::ensureAudioDeviceRunning()
         return true;
     }
 
-    // 2. Si restartLastAudioDevice fallo, re-inicializar con dispositivos predeterminados
-    auto err = deviceManager.initialiseWithDefaultDevices(0, 4);
+    // 2. Si restartLastAudioDevice falló, re-inicializar en estéreo y ampliar
+    // solamente si el dispositivo acepta cuatro salidas.
+    auto err = initialiseDefaultOutputDevice();
     if (err.isEmpty())
     {
-        auto setup = deviceManager.getAudioDeviceSetup();
-        if (auto* newDev = deviceManager.getCurrentAudioDevice())
-        {
-            auto outNames = newDev->getOutputChannelNames();
-            int numAvail = outNames.size();
-            currentNumOutputChannels.store(numAvail);
-            setup.outputChannels.setRange(0, juce::jmin(4, numAvail), true);
-            deviceManager.setAudioDeviceSetup(setup, true);
-        }
         deviceManager.addAudioCallback(this);
         DBG("[AudioEngine] Restored audio device successfully via initialiseWithDefaultDevices");
         isRecoveringDevice.store(false);
@@ -260,6 +295,17 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* /*inputCh
 {
     if (outputChannelData == nullptr || numOutputChannels == 0 || numSamples <= 0)
         return;
+
+    if (numSamples > masterBuffer.getNumSamples()
+        || numSamples > deck1Buffer.getNumSamples()
+        || numSamples > deck2Buffer.getNumSamples()
+        || numSamples > cueBuffer.getNumSamples())
+    {
+        for (int ch = 0; ch < numOutputChannels; ++ch)
+            if (outputChannelData[ch] != nullptr)
+                std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t)numSamples);
+        return;
+    }
 
     // Ensure our internal buffers match current block samples
     deck1Buffer.clear(0, numSamples);
@@ -285,14 +331,17 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* /*inputCh
     audioRecorder.pushAudioBlock(masterBuffer, numSamples);
 
     // 4. Write to physical audio output (DAC / CoreAudio)
-    int masterPair = masterChannelPair.load(); // 0 = Ch 1-2, 1 = Ch 3-4
-    int cuePair = cueChannelPair.load();       // 0 = Ch 1-2, 1 = Ch 3-4
+    const int routing = outputRouting.load();
+    const int masterPair = routing & 1;
+    const int cuePair = (routing >> 1) & 1;
 
     if (numOutputChannels >= 4)
     {
         for (int ch = 0; ch < numOutputChannels; ++ch)
         {
             auto* out = outputChannelData[ch];
+            if (out == nullptr)
+                continue;
             if (ch == masterPair * 2)
             {
                 std::memcpy(out, masterBuffer.getReadPointer(0), sizeof(float) * (size_t)numSamples);
@@ -322,12 +371,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* /*inputCh
             if (ch < 2)
             {
                 auto* out = outputChannelData[ch];
+                if (out == nullptr)
+                    continue;
                 const auto* src = masterBuffer.getReadPointer(ch);
                 std::memcpy(out, src, sizeof(float) * (size_t)numSamples);
             }
             else
             {
-                std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t)numSamples);
+                if (outputChannelData[ch] != nullptr)
+                    std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t)numSamples);
             }
         }
     }

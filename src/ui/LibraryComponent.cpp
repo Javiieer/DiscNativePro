@@ -836,8 +836,13 @@ LibraryComponent::LibraryComponent(juce::AudioFormatManager& fm)
 
     setWantsKeyboardFocus(true);
 
-    // Escaneo inicial de la carpeta de Descargas persistentes
-    scanDownloadsFolder();
+    // Load the app-owned downloads folder only after the main window has had
+    // time to appear. This folder is shallow, but metadata readers still do I/O.
+    juce::Component::SafePointer<LibraryComponent> safeThis(this);
+    juce::Timer::callAfterDelay(300, [safeThis]() {
+        if (safeThis != nullptr)
+            safeThis->scanDownloadsFolder();
+    });
 
     // Listener para registrar inmediatamente nuevas canciones descargadas de YouTube
     YouTubeAudioDownloader::getInstance().onTrackSavedToDownloads = [this](const juce::File& file, const juce::String& /*id*/, const juce::String& /*title*/, const juce::String& /*artist*/) {
@@ -1001,6 +1006,9 @@ void LibraryComponent::scanDownloadsFolder()
     {
         addTrack(f, "Descargas", dlFolder.getFullPathName(), false);
     }
+
+    folderTree.updateTree(allTracks);
+    filterTracks(searchBox.getText());
 }
 
 void LibraryComponent::addTrack(const juce::File& file, const juce::String& folderTag, const juce::String& rootFolder, bool isDemo)

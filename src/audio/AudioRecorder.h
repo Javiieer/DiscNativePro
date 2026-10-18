@@ -15,6 +15,7 @@ public:
 
     bool isRecording() const { return recording.load(std::memory_order_relaxed); }
     double getRecordingDurationSeconds() const { return durationSeconds.load(std::memory_order_relaxed); }
+    int64_t getDroppedSamples() const { return droppedSamples.load(std::memory_order_relaxed); }
     juce::File getCurrentFile() const { return currentRecordFile; }
 
     // Real-time safe: pushes audio into lock-free ring buffer (no memory allocation or file I/O)
@@ -34,6 +35,8 @@ private:
     std::atomic<bool> recording { false };
     std::atomic<double> durationSeconds { 0.0 };
     std::atomic<int64_t> totalRecordedSamples { 0 };
+    std::atomic<int64_t> droppedSamples { 0 };
+    std::atomic<int> activePushes { 0 };
     double currentSampleRate { 44100.0 };
     int channels { 2 };
 

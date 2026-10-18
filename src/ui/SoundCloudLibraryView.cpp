@@ -80,7 +80,9 @@ SoundCloudLibraryView::SoundCloudLibraryView()
     LanguageManager::getInstance().addListener(this);
     refreshLanguage();
 
-    performSearch("Tech House DJ Mix");
+    statusLabel.setText(LanguageManager::trUtf8("Escribe una búsqueda para consultar SoundCloud.",
+                                                "Enter a search to query SoundCloud."),
+                        juce::dontSendNotification);
 }
 
 SoundCloudLibraryView::~SoundCloudLibraryView()

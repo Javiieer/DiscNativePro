@@ -130,6 +130,7 @@ private:
     // Scratch state (atómicos UI<>audio; anclas solo hilo de audio)
     std::atomic<bool> scratchTouch { false };
     std::atomic<float> scratchVelRevPerSec { 0.0f };
+    std::atomic<bool> scratchResetRequested { false };
     double scratchAnchorSec { 0.0 };
     int scratchDir { 0 }; // +1 adelante, -1 atrás, 0 quieto (solo hilo de audio)
     bool scratchAnchorInit { false };
@@ -144,6 +145,7 @@ private:
     int ringWritePos { 0 }; // solo hilo de audio
     int ringValid { 0 };    // samples válidos (solo hilo de audio)
     double revHead { 0.0 }; // cabeza fraccional en samples de anillo (solo hilo de audio)
+    int scratchTailValid { 0 }; // samples guardados en scratchTail (solo hilo de audio)
 
     void writeScratchRing(const juce::AudioSourceChannelInfo& info);
     float readScratchRing(int ch, double pos) const;
@@ -158,7 +160,10 @@ private:
     std::vector<float> peaksLow;
     std::vector<float> peaksMid;
     std::vector<float> peaksHigh;
-    void extractWaveformOverview(juce::AudioFormatReader* reader);
+    void extractWaveformOverview(juce::AudioFormatReader* reader,
+                                 std::vector<float>& low,
+                                 std::vector<float>& mid,
+                                 std::vector<float>& high);
 
     double currentSampleRate { 44100.0 };
 

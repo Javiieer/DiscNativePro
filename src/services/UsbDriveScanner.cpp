@@ -77,11 +77,11 @@ std::vector<UsbDrive> UsbDriveScanner::getConnectedDrives()
         auto path = r.getFullPathName();
         auto driveType = GetDriveTypeW(path.toWideCharPointer());
 
-        // Focus on removable USB drives or secondary/external drives (excluding main C:\ drive)
+        // Do not classify every secondary fixed disk as a USB volume. On Windows
+        // this commonly includes the user's internal D: data drive.
         bool isRemovable = (driveType == DRIVE_REMOVABLE);
-        bool isSecondary = (driveType == DRIVE_FIXED && !path.startsWithIgnoreCase("C:"));
 
-        if (isRemovable || isSecondary)
+        if (isRemovable)
         {
             UsbDrive d;
             d.id = path;

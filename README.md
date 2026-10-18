@@ -75,11 +75,7 @@ cmake --build build --config Release -j
 open build/DiscNativePro_artefacts/Release/DiscNativePro.app
 ```
 
-> **Primer inicio en macOS (Binario descargado de la web o GitHub Releases)**:  
-> Al ser un proyecto de código abierto sin licencia corporativa anual de Apple, macOS Gatekeeper puede solicitar confirmación al abrir por primera vez:
-> 1. Haz clic derecho sobre `DiscNativePro.app` > **Abrir** > Confirmar **Abrir**.
-> 2. O en **Ajustes del Sistema** > **Privacidad y seguridad** > pulsa **"Abrir de todos modos"**.
-> 3. O desde Terminal: `xattr -cr /Applications/DiscNativePro.app`
+> **Primer inicio en macOS (binario descargado)**: los builds actuales no están firmados ni notarizados con Developer ID. Gatekeeper puede bloquearlos o pedir confirmación. Obtén binarios solo desde una fuente de confianza; no elimines atributos de cuarentena para eludir la verificación de origen.
 
 ---
 
@@ -185,4 +181,6 @@ cmake --build build --config Release --parallel
 
 ## Licencia
 
-Desarrollado para la suite **DiscPro**. Todos los derechos reservados.
+El código de DiscNativePro no incluye una licencia de producto que autorice modificarlo o redistribuirlo. El README upstream indica «Todos los derechos reservados». Antes de publicar o distribuir una copia derivada, se necesita una licencia o permiso explícito del titular. Esto también aplica a los instaladores y binarios compilados desde este código.
+
+Los componentes de terceros tienen sus propios términos; consulta [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ese archivo no concede derechos sobre DiscNativePro.

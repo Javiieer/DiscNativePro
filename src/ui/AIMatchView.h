@@ -37,6 +37,7 @@ private:
     std::vector<AIRecommendation> recommendations;
     bool resultsUncertain { false }; // known:false -> la IA no reconoce la pista
     juce::String lastPrefetchedVideoId;
+    int consentedProviderId { -1 };
 
     bool isLoading { false };
     juce::String statusMessage;
@@ -52,6 +53,7 @@ private:
     juce::Viewport viewport;
 
     void updateCardList();
+    void startRecommendationsRequest();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AIMatchView)
 };

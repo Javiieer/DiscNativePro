@@ -707,16 +707,21 @@ void DeckComponent::resolveVideoMetadataAsync(const juce::String& videoId)
         return;
 
     juce::String idCopy = videoId;
-    std::thread([this, idCopy]() {
+    juce::Component::SafePointer<DeckComponent> safe(this);
+    std::thread([safe, idCopy]() {
         auto details = YouTubeService::getVideoDetails(idCopy);
-        juce::MessageManager::callAsync([this, idCopy, details]() {
-            if (!isVideoMode || loadedVideoId != idCopy)
+        juce::MessageManager::callAsync([safe, idCopy, details]() {
+            if (safe == nullptr)
+                return;
+
+            auto& self = *safe;
+            if (!self.isVideoMode || self.loadedVideoId != idCopy)
                 return; // el usuario ya cargó otra cosa
 
             auto title = details.title;
             auto artist = details.artist;
             juce::String splitArtist, splitTitle;
-            if (splitArtistTitle(title, splitArtist, splitTitle)
+            if (DeckComponent::splitArtistTitle(title, splitArtist, splitTitle)
                 && (artist.isEmpty() || artist == "YouTube" || artist == "YouTube DJ" || artist == "YouTube Creator"
                     || !splitArtist.equalsIgnoreCase(artist)))
             {
@@ -724,17 +729,17 @@ void DeckComponent::resolveVideoMetadataAsync(const juce::String& videoId)
                 title = splitTitle;
             }
             if (title.isNotEmpty() && !title.startsWith("YouTube Video ("))
-                titleLabel.setText(title, juce::dontSendNotification);
+                self.titleLabel.setText(title, juce::dontSendNotification);
             if (artist.isNotEmpty())
-                artistLabel.setText(artist, juce::dontSendNotification);
+                self.artistLabel.setText(artist, juce::dontSendNotification);
 
             // Actualizar duración real del video y sincronizar la barra de progreso
             if (details.durationSeconds > 0)
             {
-                videoDurationSeconds = (double)details.durationSeconds;
-                overviewWaveform.setVideoProgress(videoPositionSeconds, videoDurationSeconds);
+                self.videoDurationSeconds = (double)details.durationSeconds;
+                self.overviewWaveform.setVideoProgress(self.videoPositionSeconds, self.videoDurationSeconds);
             }
-            repaint();
+            self.repaint();
         });
     }).detach();
 }

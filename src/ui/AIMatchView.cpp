@@ -313,6 +313,40 @@ void AIMatchView::refreshRecommendations()
         return;
     }
 
+    const auto provider = AIService::getProvider();
+    const int providerId = static_cast<int>(provider);
+    if (consentedProviderId != providerId)
+    {
+        const auto providerName = AIService::getProviderName(provider);
+        juce::String disclosureEs = "Para crear estas recomendaciones, se enviarán al proveedor ";
+        disclosureEs << providerName << " el título, artista, BPM y tonalidad de la pista activa, además de títulos, artistas, BPM y tonalidades de hasta 30 pistas de tu biblioteca. "
+                        "No se envían los archivos de audio ni sus rutas. Para una pista de YouTube también se consultan datos públicos del video. ¿Continuar?";
+        juce::String disclosureEn = "To generate these recommendations, the selected provider (";
+        disclosureEn << providerName << ") will receive the active track's title, artist, BPM and key, plus the titles, artists, BPM and keys of up to 30 tracks in your library. "
+                        "Audio files and file paths are not sent. Public video data may also be queried for a YouTube track. Continue?";
+        const auto disclosure = LanguageManager::tr(disclosureEs, disclosureEn);
+        juce::Component::SafePointer<AIMatchView> safe(this);
+        juce::AlertWindow::showOkCancelBox(
+            juce::AlertWindow::QuestionIcon,
+            LanguageManager::tr(juce::String::fromUTF8("Datos enviados a IA"), "Data sent to AI"),
+            disclosure,
+            LanguageManager::tr(juce::String::fromUTF8("Continuar"), "Continue"),
+            LanguageManager::tr(juce::String::fromUTF8("Cancelar"), "Cancel"),
+            this,
+            juce::ModalCallbackFunction::create([safe, providerId](int result) {
+                if (result != 1 || safe == nullptr)
+                    return;
+                safe->consentedProviderId = providerId;
+                safe->startRecommendationsRequest();
+            }));
+        return;
+    }
+
+    startRecommendationsRequest();
+}
+
+void AIMatchView::startRecommendationsRequest()
+{
     isLoading = true;
     errorMessage = {};
     statusMessage = LanguageManager::trUtf8("Analizando pista y generando mezclas armónicas...",
@@ -320,30 +354,35 @@ void AIMatchView::refreshRecommendations()
     listContainer->clear();
     repaint();
 
-    AIService::requestRecommendationsAsync(currentContext, [this](const std::vector<AIRecommendation>& recs, const juce::String& err) {
-        isLoading = false;
+    AIService::requestRecommendationsAsync(currentContext, [safe = juce::Component::SafePointer<AIMatchView>(this)](
+        const std::vector<AIRecommendation>& recs, const juce::String& err) {
+        if (safe == nullptr)
+            return;
+
+        auto& self = *safe;
+        self.isLoading = false;
         if (err.isNotEmpty() && recs.empty())
         {
-            errorMessage = err;
-            resultsUncertain = false;
-            repaint();
+            self.errorMessage = err;
+            self.resultsUncertain = false;
+            self.repaint();
             return;
         }
 
-        recommendations = recs;
+        self.recommendations = recs;
         // Solo marca LOCAL como badge; el orden del modelo manda (género/crowd primero)
-        AIService::resolveLocalMatches(recommendations, localFiles);
-        resultsUncertain = !recommendations.empty();
-        for (const auto& r : recommendations)
+        AIService::resolveLocalMatches(self.recommendations, self.localFiles);
+        self.resultsUncertain = !self.recommendations.empty();
+        for (const auto& r : self.recommendations)
         {
             if (r.known)
             {
-                resultsUncertain = false;
+                self.resultsUncertain = false;
                 break;
             }
         }
-        updateCardList();
-        repaint();
+        self.updateCardList();
+        self.repaint();
     });
 }
 

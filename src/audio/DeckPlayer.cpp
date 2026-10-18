@@ -30,13 +30,34 @@ bool DeckPlayer::loadFile(const juce::File& audioFile)
     if (!audioFile.existsAsFile())
         return false;
 
-    auto* reader = formatManager.createReaderFor(audioFile);
+    std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(audioFile));
     if (reader == nullptr)
         return false;
 
+    // Metadata extraction
+    auto newTrackTitle = reader->metadataValues.getValue("title", audioFile.getFileNameWithoutExtension());
+    auto newTrackArtist = reader->metadataValues.getValue("artist", "Artista Local");
+    juce::String newTrackKey = "--";
+    juce::String newTrackCamelot = "--";
+
+    double duration = (double)reader->lengthInSamples / reader->sampleRate;
+
+    // Native C++ BPM and transient analysis
+    auto beatRes = BeatDetector::analyze(reader.get());
+
+    // Native C++ Pro Harmonic Key Detection (Camelot + Musical key)
+    auto keyRes = KeyDetector::analyze(reader.get());
+    newTrackKey = (keyRes.formattedKey.isNotEmpty() && keyRes.formattedKey != "--") ? keyRes.formattedKey : keyRes.camelot;
+    newTrackCamelot = keyRes.camelot;
+
+    // Extract 3-band waveform overview peaks
+    std::vector<float> newPeaksLow, newPeaksMid, newPeaksHigh;
+    extractWaveformOverview(reader.get(), newPeaksLow, newPeaksMid, newPeaksHigh);
+
     const juce::ScopedLock sl(lock);
 
-    // Stop and clear previous pipeline
+    // Stop the previous pipeline only for the brief commit phase. The potentially
+    // long BPM/key/waveform analysis above no longer holds the audio callback lock.
     playing.store(false);
     loaded.store(false);
 
@@ -45,29 +66,17 @@ bool DeckPlayer::loadFile(const juce::File& audioFile)
     readerSource.reset();
 
     currentFile = audioFile;
-
-    // Metadata extraction
-    trackTitle = reader->metadataValues.getValue("title", audioFile.getFileNameWithoutExtension());
-    trackArtist = reader->metadataValues.getValue("artist", "Artista Local");
-    trackKey = "--";
-    trackCamelot = "--";
-
-    double duration = (double)reader->lengthInSamples / reader->sampleRate;
+    trackTitle = std::move(newTrackTitle);
+    trackArtist = std::move(newTrackArtist);
+    trackKey = std::move(newTrackKey);
+    trackCamelot = std::move(newTrackCamelot);
     trackDurationSeconds.store(duration);
     cuePositionSeconds.store(0.0);
-
-    // Native C++ BPM and transient analysis
-    auto beatRes = BeatDetector::analyze(reader);
     originalBpm.store(beatRes.bpm);
     currentBpm.store(beatRes.bpm);
-
-    // Native C++ Pro Harmonic Key Detection (Camelot + Musical key)
-    auto keyRes = KeyDetector::analyze(reader);
-    trackKey = (keyRes.formattedKey.isNotEmpty() && keyRes.formattedKey != "--") ? keyRes.formattedKey : keyRes.camelot;
-    trackCamelot = keyRes.camelot;
-
-    // Extract 3-band waveform overview peaks
-    extractWaveformOverview(reader);
+    peaksLow = std::move(newPeaksLow);
+    peaksMid = std::move(newPeaksMid);
+    peaksHigh = std::move(newPeaksHigh);
 
     // Reset hot cues
     for (size_t i = 0; i < hotCues.size(); ++i)
@@ -80,7 +89,7 @@ bool DeckPlayer::loadFile(const juce::File& audioFile)
     // Build the streaming audio pipeline
     // 1. AudioFormatReaderSource takes ownership of reader
     numSrcChannels = (int)reader->numChannels;
-    readerSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
+    readerSource = std::make_unique<juce::AudioFormatReaderSource>(reader.release(), true);
 
     // 2. BufferingAudioSource reads ahead in background thread (approx 4 seconds of buffer)
     // Memory footprint is tiny (~1-2MB) even for 2-hour long sets!
@@ -108,10 +117,9 @@ bool DeckPlayer::loadFile(const juce::File& audioFile)
 
 void DeckPlayer::prepareToPlay(int samplesPerBlockExpected, double sampleRate)
 {
+    const juce::ScopedLock sl(lock);
     currentSampleRate = sampleRate;
     expectedSamplesPerBlock = samplesPerBlockExpected;
-
-    const juce::ScopedLock sl(lock);
 
     if (bufferingSource != nullptr)
         bufferingSource->prepareToPlay(samplesPerBlockExpected, sampleRate);
@@ -153,6 +161,14 @@ void DeckPlayer::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToF
     // con pitch-tracking. Transiciones con crossfade; transporte congelado.
     if (scratchTouch.load())
     {
+        if (scratchResetRequested.exchange(false, std::memory_order_acq_rel))
+        {
+            scratchAnchorInit = false;
+            scratchDir = 0;
+            scratchTailValid = 0;
+            scratchTail.clear();
+        }
+
         double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         double dur = trackDurationSeconds.load();
         int N = bufferToFill.numSamples;
@@ -164,6 +180,7 @@ void DeckPlayer::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToF
             scratchDir = 0;
             scratchAnchorInit = true;
             scratchTail.clear();
+            scratchTailValid = 0;
         }
 
         int dir = (rate > 0.005) ? 1 : ((rate < -0.005) ? -1 : 0);
@@ -174,6 +191,7 @@ void DeckPlayer::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToF
             else
                 revHead = (double)ringWritePos; // reversa: cabeza = lo último escuchado
             scratchTail.clear();
+            scratchTailValid = 0;
             scratchDir = dir;
         }
 
@@ -221,6 +239,8 @@ void DeckPlayer::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToF
         if (step > avail)
             step = avail; // tope suave al inicio del historial
 
+        const int xfadeCount = juce::jmin(scratchXfade, N, scratchTailValid);
+
         auto* outBuf = bufferToFill.buffer;
         int outCh = outBuf->getNumChannels();
         int ringCh = scratchRing.getNumChannels();
@@ -234,19 +254,21 @@ void DeckPlayer::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToF
                 // Ventana [revHead - step, revHead] recorrida al revés con pitch-tracking
                 double p = revHead - ((double)i * step / (double)juce::jmax(1, N - 1));
                 float v = readScratchRing(rc, p);
-                if (i < scratchXfade)
+                if (i < xfadeCount)
                 {
-                    float t = (float)i / (float)scratchXfade;
+                    float t = (float)i / (float)xfadeCount;
                     float g = t * t * (3.0f - 2.0f * t);
                     v = tail[i] * (1.0f - g) + v * g;
                 }
                 d[i] = v;
             }
+            const int tailCount = juce::jmin(scratchXfade, N);
             float* t = scratchTail.getWritePointer(rc % scratchTail.getNumChannels());
-            const float* tailSrc = outBuf->getReadPointer(ch, bufferToFill.startSample + N - scratchXfade);
-            for (int i = 0; i < scratchXfade; ++i)
+            const float* tailSrc = outBuf->getReadPointer(ch, bufferToFill.startSample + N - tailCount);
+            for (int i = 0; i < tailCount; ++i)
                 t[i] = tailSrc[i];
         }
+        scratchTailValid = juce::jmin(scratchXfade, N);
 
         revHead -= step;
         scratchAnchorSec -= step / sr; // aguja UI sigue a la mano
@@ -325,10 +347,10 @@ float DeckPlayer::readScratchRing(int ch, double pos) const
     return s[i0] + (float)fr * (s[i1] - s[i0]);
 }
 
-void DeckPlayer::beginScratch(){
+void DeckPlayer::beginScratch()
+{
     scratchVelRevPerSec.store(0.0f);
-    scratchAnchorInit = false;
-    scratchDir = 0;
+    scratchResetRequested.store(true, std::memory_order_release);
     scratchTouch.store(true);
 }
 
@@ -435,6 +457,7 @@ void DeckPlayer::setPitchBend(float bend)
 
 void DeckPlayer::updatePlaybackSpeed()
 {
+    const juce::ScopedLock sl(lock);
     // 0% pitch = ratio 1.0; +8% pitch = ratio 1.08; -8% pitch = ratio 0.92
     float totalSpeed = 1.0f + (pitchPercent.load() / 100.0f) + pitchBend.load();
     totalSpeed = juce::jlimit(0.2f, 2.0f, totalSpeed);
@@ -545,14 +568,17 @@ juce::Colour DeckPlayer::getTrackKeyColour() const
     return KeyDetector::getCamelotColour(trackKey);
 }
 
-void DeckPlayer::extractWaveformOverview(juce::AudioFormatReader* reader)
+void DeckPlayer::extractWaveformOverview(juce::AudioFormatReader* reader,
+                                         std::vector<float>& low,
+                                         std::vector<float>& mid,
+                                         std::vector<float>& high)
 {
     // Alta resolución para el vertical con zoom (8000 pts ≈ 100 KB).
     // Una sola pasada secuencial: sin seeks dispersos, óptimo en MP3.
     const size_t numPoints = 8000;
-    peaksLow.assign(numPoints, 0.0f);
-    peaksMid.assign(numPoints, 0.0f);
-    peaksHigh.assign(numPoints, 0.0f);
+    low.assign(numPoints, 0.0f);
+    mid.assign(numPoints, 0.0f);
+    high.assign(numPoints, 0.0f);
 
     if (reader == nullptr || reader->lengthInSamples <= 0)
         return;
@@ -598,9 +624,9 @@ void DeckPlayer::extractWaveformOverview(juce::AudioFormatReader* reader)
     {
         float peak = (float)ptPeak[p];
         float avg = ptCount[p] > 0 ? (float)(ptSum[p] / (double)ptCount[p]) : 0.0f;
-        peaksLow[p]  = juce::jlimit(0.0f, 1.0f, peak * 0.95f);
-        peaksMid[p]  = juce::jlimit(0.0f, 1.0f, avg * 1.5f);
-        peaksHigh[p] = juce::jlimit(0.0f, 1.0f, (peak - avg) * 1.25f);
+        low[p]  = juce::jlimit(0.0f, 1.0f, peak * 0.95f);
+        mid[p]  = juce::jlimit(0.0f, 1.0f, avg * 1.5f);
+        high[p] = juce::jlimit(0.0f, 1.0f, (peak - avg) * 1.25f);
     }
 
     // Normaliza cada banda a su máximo: los temas con master bajo muestran
@@ -608,15 +634,15 @@ void DeckPlayer::extractWaveformOverview(juce::AudioFormatReader* reader)
     float maxL = 1e-6f, maxM = 1e-6f, maxH = 1e-6f;
     for (size_t p = 0; p < numPoints; ++p)
     {
-        maxL = juce::jmax(maxL, peaksLow[p]);
-        maxM = juce::jmax(maxM, peaksMid[p]);
-        maxH = juce::jmax(maxH, peaksHigh[p]);
+        maxL = juce::jmax(maxL, low[p]);
+        maxM = juce::jmax(maxM, mid[p]);
+        maxH = juce::jmax(maxH, high[p]);
     }
     for (size_t p = 0; p < numPoints; ++p)
     {
-        peaksLow[p] /= maxL;
-        peaksMid[p] /= maxM;
-        peaksHigh[p] /= maxH;
+        low[p] /= maxL;
+        mid[p] /= maxM;
+        high[p] /= maxH;
     }
 }
 

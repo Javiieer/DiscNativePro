@@ -155,3 +155,58 @@ Reemplazar la distribución en archivo `.zip` comprimido por un instalador profe
 ## 3. Verificación
 - **Compilación**: `cmake --build build -j 2` completado al 100% con 0 errores y 0 warnings.
 - **Auto-Relaunch**: App relanzada activamente con PID `180`.
+
+---
+
+# Revisión profunda local: fiabilidad, privacidad y distribución (2026-10-18)
+
+## Alcance y cambios
+
+- Audio: el análisis de pistas se hace fuera del bloqueo compartido; el scratch limita lecturas a muestras disponibles; el sampler publica buffers inmutables y corrige el ratio/límite por frecuencia de origen; la grabadora contabiliza muestras aceptadas, registra pérdidas y espera a productores antes de cerrar; los filtros EQ seleccionan coeficientes precalculados durante el callback; pitch, enrutamiento, tamaños de bloque y cierre del lector de disco tienen protecciones adicionales.
+- Ciclo de vida: la carga de metadatos de video usa `SafePointer`; los callbacks MIDI se copian con sincronización y se invalidan al cerrar/reemplazar listeners.
+- Privacidad/red: las solicitudes de IA usan HTTP de JUCE, no shell ni temporales con prompts/respuestas; las carpetas locales no se envían al proveedor y la vista de recomendaciones revela los metadatos transmitidos antes de solicitar consentimiento; las claves se enmascaran en UI y se informa que siguen guardadas sin cifrar. YouTube, SoundCloud y miniaturas validan identificadores/hosts y limitan respuestas/descargas.
+- Actualización/distribución: el actualizador exige SHA-256 de GitHub y solo descarga el activo exacto de la plataforma; deja la instalación manual. yt-dlp selecciona un activo por plataforma y verifica digest antes de instalarlo. CMake fija el hash del paquete WebView2 1.0.2903.40, alineado con los workflows. El README ya no llama open source a un producto sin licencia y se añadió un aviso parcial para Signalsmith.
+
+## Resultado de compilación
+
+- Configuración: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64` — correcta.
+- Compilación: `cmake --build build --config Release --target DiscNativePro --parallel 6` — correcta.
+- Artefacto: `build/DiscNativePro_artefacts/Release/DiscNativePro.exe`.
+- La compilación completa mostró advertencias en cabeceras Signalsmith y código existente de `LanguageManager.cpp` / `SamplerPanelComponent.cpp`; el enlace terminó correctamente.
+- No se ejecutó la aplicación ni pruebas automatizadas. El código no se validó en macOS/Linux ni con dispositivos de audio reales.
+
+## Límites de publicación
+
+- El código upstream carece de licencia de producto y el README conserva «Todos los derechos reservados». Esta copia es para análisis local; no se debe publicar ni redistribuir sin licencia o permiso expreso del titular.
+- El uso del digest de GitHub comprueba integridad frente al digest de la API; no demuestra por sí solo la identidad del autor que publicó el archivo.
+- Las API keys permanecen en texto claro dentro del archivo local de ajustes. La revisión añadió avisos, pero no implementó un almacén seguro multiplataforma.
+- Workflows aún necesitan permisos mínimos, acciones fijadas por commit, SBOM/atestaciones y estrategia de firma/notarización de macOS antes de distribución.
+
+---
+
+# Inicio visible, negociación de salidas y lectura de discos (2026-10-18)
+
+## Cambios
+
+- `src/Main.cpp`: se muestra una ventana inicial ligera antes de construir `MainComponent`.
+- `src/ui/MainComponent.cpp`: la inicialización de audio y MIDI empieza en el primer callback del componente principal, después de que la ventana ya está visible. Se aplazó la lectura de Descargas 300 ms y se refrescan tabla/árbol al terminar.
+- `src/audio/AudioEngine.cpp/.h`: la salida predeterminada se abre primero con dos canales; si el dispositivo anuncia cuatro, se intenta habilitar el par adicional y se vuelve a estéreo si el driver lo rechaza. El estado reporta canales activos, pasa a cero al detenerse el dispositivo y el camino de recuperación reutiliza la misma negociación.
+- `src/ui/SettingsModalComponent.cpp`: Preferencias distingue salida ausente, estéreo y multicanal activo.
+- `src/services/UsbDriveScanner.cpp`: Windows deja de clasificar cada volumen fijo no-C como USB. Un disco externo fijo sigue disponible con selección manual.
+- `src/ui/UsbLibraryView.cpp/.h`: no se enumeran volúmenes al construir la vista oculta; al abrir USB se listan, pero se espera que el usuario seleccione una unidad para iniciar el escaneo recursivo.
+- `src/ui/SoundCloudLibraryView.cpp`: se elimina la búsqueda automática inicial.
+- `ANALISIS_LECTURA_DISCOS.md`: auditoría estática del inventario, scan, metadata/BPM/key, deck loading, buffering, sample-rate y Media Foundation, con riesgos separados de las partes ya corregidas.
+
+## Verificación
+
+- `cmake --build build --config Release --parallel` → correcto, ejecutable Release creado.
+- La primera compilación expuso dos avisos menores; se corrigieron el bloque `if` vacío en Release y el valor inicial del enum de idioma. La compilación incremental final terminó sin avisos.
+- `git diff --check` → sin errores de whitespace (Git muestra solo avisos generales de conversión LF/CRLF en archivos ya modificados).
+- Se abrió la build y Windows UI Automation mostró la ventana `DiscNativePro`, los dos decks, la biblioteca local y los controles principales; el proceso respondió. No se cargó ni reprodujo audio.
+- La captura gráfica solicitada no se pudo obtener porque Windows Graphics Capture agotó su espera; la comprobación de la ventana fue por árbol accesible.
+- No se validó el nombre/cantidad real de salidas en Preferencias ni una controladora conectada; el hardware no se comprobó en esta sesión.
+- No se hizo un scan manual de una unidad, no se recorrió D: y no se probaron formatos de audio.
+
+## Pendientes del pipeline de lectura
+
+El escaneo manual USB y la importación local todavía recorren archivos de forma síncrona; la carga de decks vuelve a analizar BPM/key/waveform en el hilo que la solicita. La auditoría también confirma riesgo de bloqueo del callback por el lock de `BufferingAudioSource`, conversión incorrecta cuando sample-rate del archivo y dispositivo difieren, y defectos específicos del lector Media Foundation. Se proponen etapas de implementación en `ANALISIS_LECTURA_DISCOS.md`.

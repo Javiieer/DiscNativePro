@@ -1,5 +1,6 @@
 #include "UpdateService.h"
 #include <juce_events/juce_events.h>
+#include <juce_cryptography/juce_cryptography.h>
 
 namespace
 {
@@ -39,34 +40,18 @@ ReleaseItem parseReleaseItem(const juce::var& releaseObj)
         {
             auto name = a["name"].toString();
             auto dl = a["browser_download_url"].toString();
-            if (name == kAssetName && dl.isNotEmpty())
+            auto digest = a["digest"].toString().trim().toLowerCase();
+            auto hash = digest.startsWith("sha256:") ? digest.substring(7) : juce::String();
+            if (name == kAssetName && dl.isNotEmpty()
+                && hash.length() == 64 && hash.containsOnly("0123456789abcdef"))
             {
                 item.downloadUrl = dl;
                 item.assetName = name;
+                item.assetSha256 = digest;
                 break;
             }
         }
 
-        if (item.assetName.isEmpty())
-        {
-            for (auto& a : *assets)
-            {
-                auto name = a["name"].toString();
-                auto dl = a["browser_download_url"].toString();
-               #if JUCE_MAC
-                if (name.containsIgnoreCase("mac") || name.endsWithIgnoreCase(".dmg") || name.endsWithIgnoreCase(".zip"))
-               #elif JUCE_WINDOWS
-                if (name.containsIgnoreCase("win") || name.endsWithIgnoreCase(".exe") || name.endsWithIgnoreCase(".zip"))
-               #else
-                if (name.containsIgnoreCase("linux") || name.endsWithIgnoreCase(".tar.gz"))
-               #endif
-                {
-                    item.downloadUrl = dl;
-                    item.assetName = name;
-                    break;
-                }
-            }
-        }
     }
 
     return item;
@@ -229,6 +214,7 @@ void UpdateService::checkForUpdatesAsync(UpdateCallback onComplete)
             info.pageUrl = latest.pageUrl;
             info.downloadUrl = latest.downloadUrl;
             info.assetName = latest.assetName;
+            info.assetSha256 = latest.assetSha256;
 
             if (info.latestVersion.isNotEmpty()
                 && info.latestTag != getSkippedTag()
@@ -245,10 +231,11 @@ void UpdateService::checkForUpdatesAsync(UpdateCallback onComplete)
 void UpdateService::downloadAndOpenReleaseAsset(
     const juce::String& downloadUrl,
     const juce::String& assetName,
+    const juce::String& expectedSha256,
     std::function<void(float progress, const juce::String& statusText)> onProgress,
     std::function<void(bool success, const juce::String& errorMessage, const juce::File& file)> onComplete)
 {
-    juce::Thread::launch([downloadUrl, assetName, onProgress, onComplete]() {
+    juce::Thread::launch([downloadUrl, assetName, expectedSha256, onProgress, onComplete]() {
         if (downloadUrl.isEmpty())
         {
             if (onComplete)
@@ -264,6 +251,14 @@ void UpdateService::downloadAndOpenReleaseAsset(
             !downloadUrl.endsWithIgnoreCase(".exe") &&
             !downloadUrl.endsWithIgnoreCase(".tar.gz"))
         {
+            if (!downloadUrl.startsWithIgnoreCase("https://github.com/axel-molina/DiscNativePro/releases/"))
+            {
+                if (onComplete)
+                    juce::MessageManager::callAsync([onComplete]() {
+                        onComplete(false, "El enlace de actualización no coincide con la página de versiones esperada.", {});
+                    });
+                return;
+            }
             juce::URL(downloadUrl).launchInDefaultBrowser();
             if (onComplete)
                 juce::MessageManager::callAsync([onComplete]() {
@@ -272,17 +267,41 @@ void UpdateService::downloadAndOpenReleaseAsset(
             return;
         }
 
+        const auto expectedPrefix = juce::String("https://github.com/axel-molina/DiscNativePro/releases/download/");
+        auto expectedHash = expectedSha256.trim().toLowerCase();
+        if (expectedHash.startsWith("sha256:"))
+            expectedHash = expectedHash.substring(7);
+        if (!downloadUrl.startsWithIgnoreCase(expectedPrefix) || assetName != kAssetName
+            || expectedHash.length() != 64
+            || !expectedHash.containsOnly("0123456789abcdef"))
+        {
+            if (onComplete)
+                juce::MessageManager::callAsync([onComplete]() {
+                    onComplete(false, "No hay un enlace y SHA-256 válidos publicados para verificar este archivo.", {});
+                });
+            return;
+        }
+
         auto dlFolder = juce::File::getSpecialLocation(juce::File::userHomeDirectory).getChildFile("Downloads");
         if (!dlFolder.exists())
             dlFolder = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
 
-        juce::String safeFileName = assetName.isNotEmpty() ? assetName : downloadUrl.fromLastOccurrenceOf("/", false, false);
+        juce::String safeFileName = juce::File::createLegalFileName(assetName);
         if (safeFileName.isEmpty())
             safeFileName = "DiscNativePro-Update.zip";
 
         auto targetFile = dlFolder.getChildFile(safeFileName);
         if (targetFile.existsAsFile())
-            targetFile.deleteFile();
+        {
+            auto baseName = targetFile.getFileNameWithoutExtension();
+            auto extension = targetFile.getFileExtension();
+            int suffix = 1;
+            do
+            {
+                targetFile = dlFolder.getChildFile(baseName + "-" + juce::String(suffix++) + extension);
+            }
+            while (targetFile.exists());
+        }
 
         juce::URL url(downloadUrl);
         std::unique_ptr<juce::InputStream> stream(url.createInputStream(
@@ -302,27 +321,35 @@ void UpdateService::downloadAndOpenReleaseAsset(
         }
 
         juce::int64 totalLength = stream->getTotalLength();
-        std::unique_ptr<juce::FileOutputStream> out(targetFile.createOutputStream());
+        auto tempFile = juce::File::createTempFile("DiscNativePro-Update");
+        std::unique_ptr<juce::FileOutputStream> out(tempFile.createOutputStream());
         if (out == nullptr || !out->openedOk())
         {
+            tempFile.deleteFile();
             if (onComplete)
                 juce::MessageManager::callAsync([onComplete]() {
-                    onComplete(false, "No se pudo crear el archivo en Descargas.", {});
+                    onComplete(false, "No se pudo crear el archivo temporal de actualización.", {});
                 });
             return;
         }
 
         constexpr juce::int64 bufferSize = 64 * 1024;
+        constexpr juce::int64 maxDownloadBytes = 1024LL * 1024LL * 1024LL;
         juce::HeapBlock<char> buffer((size_t)bufferSize);
         juce::int64 bytesWritten = 0;
 
-        while (!stream->isExhausted())
+        bool writeFailed = false;
+        while (!stream->isExhausted() && bytesWritten <= maxDownloadBytes)
         {
             int read = stream->read(buffer.get(), (int)bufferSize);
             if (read <= 0)
                 break;
 
-            out->write(buffer.get(), (size_t)read);
+            if (bytesWritten + read > maxDownloadBytes || !out->write(buffer.get(), (size_t)read))
+            {
+                writeFailed = true;
+                break;
+            }
             bytesWritten += read;
 
             if (onProgress && totalLength > 0)
@@ -340,32 +367,18 @@ void UpdateService::downloadAndOpenReleaseAsset(
         out->flush();
         out.reset();
 
-        bool success = targetFile.existsAsFile() && targetFile.getSize() > 1000;
+        bool success = !writeFailed && tempFile.existsAsFile() && tempFile.getSize() > 1000
+                    && (totalLength <= 0 || bytesWritten == totalLength);
+        if (success)
+            success = juce::SHA256(tempFile).toHexString().equalsIgnoreCase(expectedHash);
+        if (success)
+        {
+            success = tempFile.moveFileTo(targetFile);
+        }
         if (success)
         {
             juce::MessageManager::callAsync([onComplete, targetFile]() {
-               #if JUCE_MAC
-                if (targetFile.getFileExtension().equalsIgnoreCase(".dmg"))
-                {
-                    targetFile.startAsProcess();
-                }
-                else
-                {
-                    targetFile.revealToUser();
-                    targetFile.startAsProcess();
-                }
-               #elif JUCE_WINDOWS
-                if (targetFile.getFileExtension().equalsIgnoreCase(".exe"))
-                {
-                    targetFile.startAsProcess();
-                }
-                else
-                {
-                    targetFile.revealToUser();
-                }
-               #else
                 targetFile.revealToUser();
-               #endif
 
                 if (onComplete)
                     onComplete(true, {}, targetFile);
@@ -373,9 +386,10 @@ void UpdateService::downloadAndOpenReleaseAsset(
         }
         else
         {
+            tempFile.deleteFile();
             if (onComplete)
                 juce::MessageManager::callAsync([onComplete]() {
-                    onComplete(false, "El archivo descargado está incompleto o dañado.", {});
+                    onComplete(false, "El archivo está incompleto o su SHA-256 no coincide con el publicado por GitHub.", {});
                 });
         }
     });

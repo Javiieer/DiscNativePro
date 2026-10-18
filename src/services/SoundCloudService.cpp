@@ -8,18 +8,85 @@
 namespace
 {
     std::mutex scImageCacheMutex;
+    std::mutex scClientIdMutex;
     std::map<juce::String, juce::Image> scArtworkCache;
     juce::String customClientId;
     const char* defaultClientId = "kR7dAfT5UXQgmgde1pLjfsRGiaoANLvT";
+
+    bool isAllowedSoundCloudUrl(const juce::String& value)
+    {
+        const juce::URL url(value);
+        if (!url.isWellFormed() || !url.toString(false).startsWithIgnoreCase("https://"))
+            return false;
+
+        const auto host = url.getDomain().toLowerCase();
+        return host == "soundcloud.com" || host.endsWith(".soundcloud.com")
+            || host == "sndcdn.com" || host.endsWith(".sndcdn.com");
+    }
+
+    bool isValidTrackId(const juce::String& id)
+    {
+        return id.isNotEmpty() && id.length() <= 20 && id.containsOnly("0123456789");
+    }
+
+    juce::String readBounded(juce::InputStream& stream, juce::int64 maxBytes)
+    {
+        juce::MemoryOutputStream output;
+        char buffer[8192];
+        while (!stream.isExhausted())
+        {
+            const int bytesRead = stream.read(buffer, (int)sizeof(buffer));
+            if (bytesRead <= 0)
+                break;
+            if (output.getDataSize() + (size_t)bytesRead > (size_t)maxBytes)
+                return {};
+            output.write(buffer, (size_t)bytesRead);
+        }
+        return output.toString();
+    }
+
+    bool appendBounded(juce::FileOutputStream& output, juce::InputStream& input,
+                       juce::int64& totalBytes, juce::int64 maxBytes)
+    {
+        char buffer[32 * 1024];
+        while (!input.isExhausted())
+        {
+            const int bytesRead = input.read(buffer, (int)sizeof(buffer));
+            if (bytesRead <= 0)
+                break;
+            if (totalBytes + bytesRead > maxBytes || !output.write(buffer, (size_t)bytesRead))
+                return false;
+            totalBytes += bytesRead;
+        }
+        return true;
+    }
+
+    juce::Image readImageBounded(juce::InputStream& input, juce::int64 maxBytes)
+    {
+        juce::MemoryOutputStream output;
+        char buffer[8192];
+        while (!input.isExhausted())
+        {
+            const int bytesRead = input.read(buffer, (int)sizeof(buffer));
+            if (bytesRead <= 0)
+                break;
+            if (output.getDataSize() + (size_t)bytesRead > (size_t)maxBytes)
+                return {};
+            output.write(buffer, (size_t)bytesRead);
+        }
+        return juce::ImageFileFormat::loadFrom(output.getData(), output.getDataSize());
+    }
 }
 
 juce::String SoundCloudService::getClientId()
 {
+    const std::lock_guard<std::mutex> lock(scClientIdMutex);
     return customClientId.isNotEmpty() ? customClientId : juce::String(defaultClientId);
 }
 
 void SoundCloudService::setClientId(const juce::String& id)
 {
+    const std::lock_guard<std::mutex> lock(scClientIdMutex);
     customClientId = id.trim();
 }
 
@@ -42,7 +109,7 @@ std::vector<SoundCloudTrackItem> SoundCloudService::search(const juce::String& q
 
     juce::String encoded = juce::URL::addEscapeChars(q, true);
     juce::String urlStr = "https://api-v2.soundcloud.com/search/tracks?q=" + encoded
-                        + "&client_id=" + getClientId()
+                        + "&client_id=" + juce::URL::addEscapeChars(getClientId(), true)
                         + "&limit=40";
 
     juce::URL searchUrl(urlStr);
@@ -52,7 +119,7 @@ std::vector<SoundCloudTrackItem> SoundCloudService::search(const juce::String& q
     if (stream == nullptr)
         return results;
 
-    juce::String jsonText = stream->readEntireStreamAsString();
+    juce::String jsonText = readBounded(*stream, 4 * 1024 * 1024);
     auto parsed = juce::JSON::parse(jsonText);
     if (!parsed.isObject() || !parsed.hasProperty("collection"))
         return results;
@@ -69,6 +136,8 @@ std::vector<SoundCloudTrackItem> SoundCloudService::search(const juce::String& q
 
         SoundCloudTrackItem track;
         track.id = item["id"].toString();
+        if (!isValidTrackId(track.id))
+            continue;
         track.title = item["title"].toString();
 
         if (item.hasProperty("user") && item["user"].isObject())
@@ -135,6 +204,9 @@ void SoundCloudService::searchAsync(const juce::String& query,
 
 juce::File SoundCloudService::downloadHlsStream(const juce::String& hlsAuthUrl, const juce::String& trackId)
 {
+    if (!isValidTrackId(trackId) || !isAllowedSoundCloudUrl(hlsAuthUrl))
+        return {};
+
     auto cacheDir = getCacheDirectory();
     auto targetFile = cacheDir.getChildFile("sc_" + trackId + ".m4a");
     if (targetFile.existsAsFile() && targetFile.getSize() > 10000)
@@ -142,31 +214,36 @@ juce::File SoundCloudService::downloadHlsStream(const juce::String& hlsAuthUrl, 
 
     juce::String authUrlStr = hlsAuthUrl;
     if (!authUrlStr.contains("client_id="))
-        authUrlStr += (authUrlStr.contains("?") ? "&" : "?") + juce::String("client_id=") + getClientId();
+        authUrlStr += (authUrlStr.contains("?") ? "&" : "?") + juce::String("client_id=")
+                    + juce::URL::addEscapeChars(getClientId(), true);
 
     juce::URL authUrl(authUrlStr);
+    if (!isAllowedSoundCloudUrl(authUrlStr))
+        return {};
     auto authStream = authUrl.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
                                                     .withConnectionTimeoutMs(8000)
+                                                    .withNumRedirectsToFollow(0)
                                                     .withExtraHeaders("User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"));
     if (authStream == nullptr)
         return {};
 
-    auto parsed = juce::JSON::parse(authStream->readEntireStreamAsString());
+    auto parsed = juce::JSON::parse(readBounded(*authStream, 1024 * 1024));
     if (!parsed.isObject() || !parsed.hasProperty("url"))
         return {};
 
     juce::String m3u8Url = parsed["url"].toString();
-    if (m3u8Url.isEmpty())
+    if (!isAllowedSoundCloudUrl(m3u8Url))
         return {};
 
     juce::URL playlistUrl(m3u8Url);
     auto playlistStream = playlistUrl.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
                                                             .withConnectionTimeoutMs(10000)
+                                                            .withNumRedirectsToFollow(0)
                                                             .withExtraHeaders("User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"));
     if (playlistStream == nullptr)
         return {};
 
-    juce::String m3u8Text = playlistStream->readEntireStreamAsString();
+    juce::String m3u8Text = readBounded(*playlistStream, 2 * 1024 * 1024);
     if (m3u8Text.isEmpty())
         return {};
 
@@ -189,14 +266,24 @@ juce::File SoundCloudService::downloadHlsStream(const juce::String& hlsAuthUrl, 
     {
         auto trimmed = l.trim();
         if (trimmed.isNotEmpty() && !trimmed.startsWithChar('#'))
+        {
+            if (!isAllowedSoundCloudUrl(trimmed))
+                return {};
             segmentUrls.add(trimmed);
+        }
     }
+
+    if (initUrl.isNotEmpty() && !isAllowedSoundCloudUrl(initUrl))
+        return {};
 
     if (segmentUrls.isEmpty())
         return {};
 
     auto tempFile = targetFile.getSiblingFile(targetFile.getFileName() + ".tmp");
     tempFile.deleteFile();
+    juce::int64 totalBytes = 0;
+    constexpr juce::int64 maxTrackBytes = 256LL * 1024LL * 1024LL;
+    bool transferOk = true;
 
     {
         juce::FileOutputStream fos(tempFile);
@@ -209,26 +296,34 @@ juce::File SoundCloudService::downloadHlsStream(const juce::String& hlsAuthUrl, 
             juce::URL u(initUrl);
             auto s = u.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
                                              .withConnectionTimeoutMs(8000)
+                                             .withNumRedirectsToFollow(0)
                                              .withExtraHeaders("User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"));
-            if (s != nullptr)
-                fos.writeFromInputStream(*s, -1);
+            transferOk = s != nullptr && appendBounded(fos, *s, totalBytes, maxTrackBytes);
         }
 
         // Download segments
         for (auto& segUrl : segmentUrls)
         {
+            if (!transferOk)
+                break;
             juce::URL u(segUrl);
             auto s = u.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
                                              .withConnectionTimeoutMs(10000)
+                                             .withNumRedirectsToFollow(0)
                                              .withExtraHeaders("User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"));
-            if (s != nullptr)
-                fos.writeFromInputStream(*s, -1);
+            transferOk = s != nullptr && appendBounded(fos, *s, totalBytes, maxTrackBytes);
         }
+        fos.flush();
     }
 
-    if (tempFile.existsAsFile() && tempFile.getSize() > 10000)
+    if (!transferOk)
     {
-        tempFile.moveFileTo(targetFile);
+        tempFile.deleteFile();
+        return {};
+    }
+
+    if (tempFile.existsAsFile() && tempFile.getSize() > 10000 && tempFile.moveFileTo(targetFile))
+    {
         return targetFile;
     }
 
@@ -239,7 +334,8 @@ juce::File SoundCloudService::downloadHlsStream(const juce::String& hlsAuthUrl, 
 void SoundCloudService::downloadTrackAsync(const SoundCloudTrackItem& item,
                                            std::function<void(const juce::File&)> onDownloaded)
 {
-    if (item.id.isEmpty() || (item.progressiveStreamAuthUrl.isEmpty() && item.hlsStreamAuthUrl.isEmpty()))
+    if (!isValidTrackId(item.id)
+        || (item.progressiveStreamAuthUrl.isEmpty() && item.hlsStreamAuthUrl.isEmpty()))
     {
         if (onDownloaded)
             juce::MessageManager::callAsync([onDownloaded]() { onDownloaded(juce::File()); });
@@ -247,10 +343,11 @@ void SoundCloudService::downloadTrackAsync(const SoundCloudTrackItem& item,
     }
 
     auto cacheDir = getCacheDirectory();
-    auto ext = item.progressiveStreamAuthUrl.isNotEmpty() ? ".mp3" : ".m4a";
+    const bool hasProgressiveStream = item.progressiveStreamAuthUrl.isNotEmpty();
+    const juce::String ext = hasProgressiveStream ? ".mp3" : ".m4a";
     auto targetFile = cacheDir.getChildFile("sc_" + item.id + ext);
 
-    auto altTarget = cacheDir.getChildFile("sc_" + item.id + (ext == ".mp3" ? ".m4a" : ".mp3"));
+    auto altTarget = cacheDir.getChildFile("sc_" + item.id + (hasProgressiveStream ? ".m4a" : ".mp3"));
     if (altTarget.existsAsFile() && altTarget.getSize() > 10000)
         targetFile = altTarget;
 
@@ -272,40 +369,55 @@ void SoundCloudService::downloadTrackAsync(const SoundCloudTrackItem& item,
         if (item.progressiveStreamAuthUrl.isNotEmpty())
         {
             juce::String authUrlStr = item.progressiveStreamAuthUrl;
-            if (!authUrlStr.contains("client_id="))
-                authUrlStr += (authUrlStr.contains("?") ? "&" : "?") + juce::String("client_id=") + getClientId();
+            if (!isAllowedSoundCloudUrl(authUrlStr))
+                authUrlStr = {};
+            if (authUrlStr.isNotEmpty() && !authUrlStr.contains("client_id="))
+                authUrlStr += (authUrlStr.contains("?") ? "&" : "?") + juce::String("client_id=")
+                            + juce::URL::addEscapeChars(getClientId(), true);
 
             juce::URL authUrl(authUrlStr);
-            auto authStream = authUrl.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+            auto authStream = authUrlStr.isNotEmpty() ? authUrl.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
                                                             .withConnectionTimeoutMs(8000)
-                                                            .withExtraHeaders("User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"));
+                                                            .withNumRedirectsToFollow(0)
+                                                            .withExtraHeaders("User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n")) : nullptr;
 
             juce::String directStreamUrl;
             if (authStream != nullptr)
             {
-                auto parsed = juce::JSON::parse(authStream->readEntireStreamAsString());
+                auto parsed = juce::JSON::parse(readBounded(*authStream, 1024 * 1024));
                 if (parsed.isObject() && parsed.hasProperty("url"))
                     directStreamUrl = parsed["url"].toString();
             }
 
-            if (directStreamUrl.isNotEmpty())
+            if (isAllowedSoundCloudUrl(directStreamUrl))
             {
                 juce::URL downloadUrl(directStreamUrl);
                 auto dlStream = downloadUrl.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
                                                                   .withConnectionTimeoutMs(15000)
+                                                                  .withNumRedirectsToFollow(0)
                                                                   .withExtraHeaders("User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"));
                 if (dlStream != nullptr)
                 {
                     {
                         juce::FileOutputStream fos(tempFile);
                         if (fos.openedOk())
-                            fos.writeFromInputStream(*dlStream, -1);
+                        {
+                            juce::int64 totalBytes = 0;
+                            constexpr juce::int64 maxTrackBytes = 256LL * 1024LL * 1024LL;
+                            downloadOk = appendBounded(fos, *dlStream, totalBytes, maxTrackBytes);
+                            fos.flush();
+                            downloadOk = downloadOk && totalBytes > 10000;
+                        }
                     }
 
-                    if (tempFile.existsAsFile() && tempFile.getSize() > 10000)
+                    if (downloadOk && tempFile.existsAsFile() && tempFile.getSize() > 10000
+                        && tempFile.moveFileTo(targetFile))
                     {
-                        tempFile.moveFileTo(targetFile);
                         downloadOk = true;
+                    }
+                    else
+                    {
+                        downloadOk = false;
                     }
                 }
             }
@@ -347,7 +459,7 @@ void SoundCloudService::downloadTrackAsync(const SoundCloudTrackItem& item,
 void SoundCloudService::loadArtworkAsync(const juce::String& artworkUrl,
                                          std::function<void(const juce::Image&)> onImageLoaded)
 {
-    if (artworkUrl.isEmpty())
+    if (!isAllowedSoundCloudUrl(artworkUrl))
         return;
 
     {
@@ -366,12 +478,11 @@ void SoundCloudService::loadArtworkAsync(const juce::String& artworkUrl,
     std::thread([artworkUrl, cb = std::move(onImageLoaded)]() {
         juce::URL url(artworkUrl);
         auto stream = url.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
-                                                .withConnectionTimeoutMs(6000));
+                                                .withConnectionTimeoutMs(6000)
+                                                .withNumRedirectsToFollow(0));
         juce::Image img;
         if (stream != nullptr)
-        {
-            img = juce::ImageFileFormat::loadFrom(*stream);
-        }
+            img = readImageBounded(*stream, 10 * 1024 * 1024);
 
         if (img.isValid())
         {

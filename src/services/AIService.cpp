@@ -3,12 +3,6 @@
 #include "LanguageManager.h"
 #include <juce_events/juce_events.h>
 #include <thread>
-#include <cstdio>
-
-#if JUCE_WINDOWS
-#define popen _popen
-#define pclose _pclose
-#endif
 
 juce::File AIService::getSettingsFile()
 {
@@ -254,8 +248,6 @@ juce::String AIService::buildPrompt(const CurrentTrackContext& context)
                 prompt << " (BPM: " << juce::String(c.bpm, 1) << ")";
             if (c.key.isNotEmpty() && c.key != "--")
                 prompt << " [Key: " << c.key << "]";
-            if (c.folder.isNotEmpty() && c.folder != "Todas las Pistas")
-                prompt << " {Carpeta: " << c.folder << "}";
             prompt << "\n";
         }
         prompt << "\n";
@@ -522,6 +514,14 @@ void AIService::requestRecommendationsAsync(
         });
         return;
     }
+    if (apiKey.containsChar('\r') || apiKey.containsChar('\n'))
+    {
+        juce::MessageManager::callAsync([onComplete]() {
+            if (onComplete)
+                onComplete({}, "La clave API contiene caracteres no válidos.");
+        });
+        return;
+    }
 
     std::thread([context, provider, apiKey, modelName, onComplete]() {
 #if JUCE_DEBUG
@@ -558,7 +558,13 @@ void AIService::requestRecommendationsAsync(
         if (provider == AIProvider::Gemini)
         {
             // ponytail: modelo configurable por usuario; Google depreca IDs seguido, no quemar literales aquí
-            endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" + modelName + ":generateContent?key=" + apiKey;
+            if (!modelName.containsOnly("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"))
+            {
+                parseError = "El identificador del modelo de Gemini contiene caracteres no válidos.";
+                break;
+            }
+            endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" + modelName + ":generateContent";
+            authHeader = "x-goog-api-key: " + apiKey + "\r\n";
 
             // Gemini payload
             juce::var partsArray;
@@ -581,7 +587,7 @@ void AIService::requestRecommendationsAsync(
         else if (provider == AIProvider::OpenAI)
         {
             endpoint = "https://api.openai.com/v1/chat/completions";
-            authHeader = "-H \"Authorization: Bearer " + apiKey + "\"";
+            authHeader = "Authorization: Bearer " + apiKey + "\r\n";
 
             payload.getDynamicObject()->setProperty("model", modelName);
 
@@ -602,7 +608,7 @@ void AIService::requestRecommendationsAsync(
         else if (provider == AIProvider::DeepSeek)
         {
             endpoint = "https://api.deepseek.com/chat/completions";
-            authHeader = "-H \"Authorization: Bearer " + apiKey + "\"";
+            authHeader = "Authorization: Bearer " + apiKey + "\r\n";
 
             payload.getDynamicObject()->setProperty("model", modelName);
 
@@ -623,7 +629,7 @@ void AIService::requestRecommendationsAsync(
         else if (provider == AIProvider::Claude)
         {
             endpoint = "https://api.anthropic.com/v1/messages";
-            authHeader = "-H \"x-api-key: " + apiKey + "\" -H \"anthropic-version: 2023-06-01\"";
+            authHeader = "x-api-key: " + apiKey + "\r\nanthropic-version: 2023-06-01\r\n";
 
             payload.getDynamicObject()->setProperty("model", modelName);
             payload.getDynamicObject()->setProperty("max_tokens", 1600);
@@ -641,9 +647,9 @@ void AIService::requestRecommendationsAsync(
             // API compatible con OpenAI; sin response_format (algunos modelos free devuelven 400).
             // El salvamento por llaves de parseResponse cubre el formato.
             endpoint = "https://openrouter.ai/api/v1/chat/completions";
-            authHeader = "-H \"Authorization: Bearer " + apiKey + "\""
-                       + " -H \"HTTP-Referer: https://discnativepro.app\""
-                       + " -H \"X-Title: DiscNativePro\"";
+            authHeader = "Authorization: Bearer " + apiKey + "\r\n"
+                       + "HTTP-Referer: https://discnativepro.app\r\n"
+                       + "X-Title: DiscNativePro\r\n";
 
             payload.getDynamicObject()->setProperty("model", modelName);
 
@@ -660,31 +666,51 @@ void AIService::requestRecommendationsAsync(
 
         postData = juce::JSON::toString(payload);
 
-        // Write payload to temp file for curl execution
-        auto tempFile = juce::File::createTempFile("ai_req_");
-        tempFile.replaceWithText(postData);
+        juce::URL requestUrl(endpoint);
+        requestUrl = requestUrl.withPOSTData(postData);
 
-        auto respFile = juce::File::createTempFile("ai_resp_");
-
-        juce::String curlCmd = "curl -s -L --max-time 15 -X POST \"" + endpoint + "\" "
-                             + "-H \"Content-Type: application/json\" "
-                             + authHeader + " "
-                             + "--data-binary \"@" + tempFile.getFullPathName() + "\" "
-                             + "-o \"" + respFile.getFullPathName() + "\"";
-
-        int res = system(curlCmd.toRawUTF8());
-        tempFile.deleteFile();
-
+        int httpStatus = 0;
+        auto requestHeaders = juce::String("Content-Type: application/json\r\n") + authHeader;
+        auto requestOptions = juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
+                                  .withConnectionTimeoutMs(15000)
+                                  .withNumRedirectsToFollow(0)
+                                  .withExtraHeaders(requestHeaders)
+                                  .withStatusCode(&httpStatus);
+        std::unique_ptr<juce::InputStream> responseStream(requestUrl.createInputStream(requestOptions));
         juce::String rawResponse;
-        if (res == 0 && respFile.existsAsFile())
+        bool responseTooLarge = false;
+        if (responseStream != nullptr)
         {
-            rawResponse = respFile.loadFileAsString();
-            respFile.deleteFile();
+            constexpr size_t maxResponseBytes = 2 * 1024 * 1024;
+            char responseBuffer[8192];
+            juce::MemoryOutputStream responseData;
+            while (!responseStream->isExhausted())
+            {
+                const int bytesRead = responseStream->read(responseBuffer, (int)sizeof(responseBuffer));
+                if (bytesRead <= 0)
+                    break;
+                if (responseData.getDataSize() + (size_t)bytesRead > maxResponseBytes)
+                {
+                    responseTooLarge = true;
+                    break;
+                }
+                responseData.write(responseBuffer, (size_t)bytesRead);
+            }
+            if (!responseTooLarge && responseData.getDataSize() > 0)
+                rawResponse = juce::String::fromUTF8(static_cast<const char*>(responseData.getData()),
+                                                     (int)responseData.getDataSize());
         }
 
+        if (responseTooLarge)
+        {
+            parseError = "La respuesta del proveedor de IA excede el límite permitido.";
+            break;
+        }
         if (rawResponse.isEmpty())
         {
-            parseError = juce::String::fromUTF8("No hubo respuesta del servidor o tiempo de espera agotado.");
+            parseError = httpStatus > 0
+                ? "El proveedor de IA no devolvió una respuesta válida (HTTP " + juce::String(httpStatus) + ")."
+                : juce::String::fromUTF8("No hubo respuesta del servidor o tiempo de espera agotado.");
             break;
         }
 
@@ -700,15 +726,6 @@ void AIService::requestRecommendationsAsync(
                 break;
             }
         }
-#if JUCE_DEBUG
-        {
-            auto dumpFile = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-                                .getChildFile("DiscNativePro")
-                                .getChildFile("ai_last_response.json");
-            dumpFile.replaceWithText(rawResponse);
-            DBG("AI-Match: respuesta cruda en " << dumpFile.getFullPathName());
-        }
-#endif
         recs = parseResponse(provider, rawResponse, parseError);
         } // for attempt
 
@@ -722,7 +739,8 @@ void AIService::requestRecommendationsAsync(
         DBG("AI-Match: total " << (juce::Time::getMillisecondCounter() - t0) << " ms (" << recs.size() << " recs)");
 
         juce::MessageManager::callAsync([onComplete, recs, parseError]() {
-            onComplete(recs, parseError);
+            if (onComplete)
+                onComplete(recs, parseError);
         });
     }).detach();
 }

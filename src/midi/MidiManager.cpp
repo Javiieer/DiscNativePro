@@ -18,6 +18,7 @@ void MidiManager::initialise()
 
 void MidiManager::shutdown()
 {
+    callbackGenerationState->fetch_add(1, std::memory_order_acq_rel);
     stopTimer();
     auto devices = juce::MidiInput::getAvailableDevices();
     for (const auto& dev : devices)
@@ -58,8 +59,8 @@ void MidiManager::rescanDevices()
 
     deviceConnected = !connectedDevices.isEmpty();
 
-    if (onDevicesChanged)
-        onDevicesChanged();
+    if (auto callback = getCallback(devicesChangedCallback))
+        (*callback.callback)();
 }
 
 void MidiManager::sendMidiMessage(const juce::MidiMessage& message)
@@ -166,7 +167,7 @@ void MidiManager::handleJogWheel(int deckIndex, int cc, int val)
 void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const juce::MidiMessage& message)
 {
     // Format message description for live UI monitor
-    if (onMidiActivity)
+    if (getCallback(midiActivityCallback))
     {
         juce::String actText;
         if (message.isController())
@@ -199,10 +200,7 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
             actText = message.getDescription();
         }
 
-        juce::MessageManager::callAsync([this, actText]() {
-            if (onMidiActivity)
-                onMidiActivity(actText);
-        });
+        dispatchCallback(getCallback(midiActivityCallback), actText);
     }
 
     // 1. Pioneer DDJ-SB2 Tempo Faders (14-bit Pitch Bend Messages: 0xE0 on Ch 1, 0xE1 on Ch 2)
@@ -396,12 +394,7 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
                 case 64: // DDJ-SB2 BROWSE Rotary encoder (1 = CW/down, 127 = CCW/up)
                 {
                     int delta = (val < 64) ? val : (val - 128);
-                    if (onBrowseRotate)
-                    {
-                        juce::MessageManager::callAsync([this, delta]() {
-                            if (onBrowseRotate) onBrowseRotate(delta);
-                        });
-                    }
+                    dispatchCallback(getCallback(browseRotateCallback), delta);
                     return;
                 }
                 default:
@@ -415,12 +408,7 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
             case 64: // Generic BROWSE encoder
             {
                 int delta = (val < 64) ? val : (val - 128);
-                if (onBrowseRotate)
-                {
-                    juce::MessageManager::callAsync([this, delta]() {
-                        if (onBrowseRotate) onBrowseRotate(delta);
-                    });
-                }
+                dispatchCallback(getCallback(browseRotateCallback), delta);
                 break;
             }
             case 14: // Standard Master Volume on DJ controllers
@@ -493,11 +481,9 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
         {
             if (note == 11) // Play/Pause Deck 1
             {
-                if (onPlayPause)
+                if (auto callback = getCallback(playPauseCallback))
                 {
-                    juce::MessageManager::callAsync([this]() {
-                        if (onPlayPause) onPlayPause(0);
-                    });
+                    dispatchCallback(callback, 0);
                 }
                 else
                 {
@@ -508,11 +494,9 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
             }
             if (note == 12) // Cue Deck 1
             {
-                if (onCue)
+                if (auto callback = getCallback(cueCallback))
                 {
-                    juce::MessageManager::callAsync([this]() {
-                        if (onCue) onCue(0);
-                    });
+                    dispatchCallback(callback, 0);
                 }
                 else
                 {
@@ -555,11 +539,9 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
         {
             if (note == 11) // Play/Pause Deck 2
             {
-                if (onPlayPause)
+                if (auto callback = getCallback(playPauseCallback))
                 {
-                    juce::MessageManager::callAsync([this]() {
-                        if (onPlayPause) onPlayPause(1);
-                    });
+                    dispatchCallback(callback, 1);
                 }
                 else
                 {
@@ -570,11 +552,9 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
             }
             if (note == 12) // Cue Deck 2
             {
-                if (onCue)
+                if (auto callback = getCallback(cueCallback))
                 {
-                    juce::MessageManager::callAsync([this]() {
-                        if (onCue) onCue(1);
-                    });
+                    dispatchCallback(callback, 1);
                 }
                 else
                 {
@@ -617,32 +597,17 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
         {
             if (note == 65) // BROWSE push (click)
             {
-                if (onBrowseClick)
-                {
-                    juce::MessageManager::callAsync([this]() {
-                        if (onBrowseClick) onBrowseClick();
-                    });
-                }
+                dispatchCallback(getCallback(browseClickCallback));
                 return;
             }
             if (note == 70) // LOAD Deck 1
             {
-                if (onLoadTrack)
-                {
-                    juce::MessageManager::callAsync([this]() {
-                        if (onLoadTrack) onLoadTrack(0);
-                    });
-                }
+                dispatchCallback(getCallback(loadTrackCallback), 0);
                 return;
             }
             if (note == 71) // LOAD Deck 2
             {
-                if (onLoadTrack)
-                {
-                    juce::MessageManager::callAsync([this]() {
-                        if (onLoadTrack) onLoadTrack(1);
-                    });
-                }
+                dispatchCallback(getCallback(loadTrackCallback), 1);
                 return;
             }
         }
@@ -650,38 +615,21 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
         // 4. Generic Note fallbacks (Deck 1 / Deck 2 / Browse / Load)
         if (note == 65) // Generic Browse Click
         {
-            if (onBrowseClick)
-            {
-                juce::MessageManager::callAsync([this]() {
-                    if (onBrowseClick) onBrowseClick();
-                });
-            }
+            dispatchCallback(getCallback(browseClickCallback));
         }
         else if (note == 70) // Generic Load Deck 1
         {
-            if (onLoadTrack)
-            {
-                juce::MessageManager::callAsync([this]() {
-                    if (onLoadTrack) onLoadTrack(0);
-                });
-            }
+            dispatchCallback(getCallback(loadTrackCallback), 0);
         }
         else if (note == 71) // Generic Load Deck 2
         {
-            if (onLoadTrack)
-            {
-                juce::MessageManager::callAsync([this]() {
-                    if (onLoadTrack) onLoadTrack(1);
-                });
-            }
+            dispatchCallback(getCallback(loadTrackCallback), 1);
         }
         else if (note == 11) // Play/Pause Deck 1
         {
-            if (onPlayPause)
+            if (auto callback = getCallback(playPauseCallback))
             {
-                juce::MessageManager::callAsync([this]() {
-                    if (onPlayPause) onPlayPause(0);
-                });
+                dispatchCallback(callback, 0);
             }
             else
             {
@@ -691,11 +639,9 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
         }
         else if (note == 12) // Cue Deck 1
         {
-            if (onCue)
+            if (auto callback = getCallback(cueCallback))
             {
-                juce::MessageManager::callAsync([this]() {
-                    if (onCue) onCue(0);
-                });
+                dispatchCallback(callback, 0);
             }
             else
             {
@@ -709,11 +655,9 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
         }
         else if (note == 15) // Play/Pause Deck 2
         {
-            if (onPlayPause)
+            if (auto callback = getCallback(playPauseCallback))
             {
-                juce::MessageManager::callAsync([this]() {
-                    if (onPlayPause) onPlayPause(1);
-                });
+                dispatchCallback(callback, 1);
             }
             else
             {
@@ -723,11 +667,9 @@ void MidiManager::handleIncomingMidiMessage(juce::MidiInput* /*source*/, const j
         }
         else if (note == 16) // Cue Deck 2
         {
-            if (onCue)
+            if (auto callback = getCallback(cueCallback))
             {
-                juce::MessageManager::callAsync([this]() {
-                    if (onCue) onCue(1);
-                });
+                dispatchCallback(callback, 1);
             }
             else
             {
