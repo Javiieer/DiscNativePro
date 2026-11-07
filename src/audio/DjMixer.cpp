@@ -4,6 +4,7 @@
 void ChannelStrip::prepare(double sampleRate, int /*blockSize*/)
 {
     reset();
+    coefficientsValid = false;
 
     // Prepare default coefficients
     auto defaultCoeffs = juce::dsp::IIR::Coefficients<float>::makeAllPass(sampleRate, 1000.0f);
@@ -40,53 +41,62 @@ void ChannelStrip::process(juce::AudioBuffer<float>& buffer, juce::AudioBuffer<f
     if (numSamples <= 0 || sampleRate <= 0.0)
         return;
 
-    // 1. Calculate 3-band EQ coefficients
-    float lowKnob = juce::jlimit(0.0f, 1.0f, eqLow.load());
-    float midKnob = juce::jlimit(0.0f, 1.0f, eqMid.load());
-    float highKnob = juce::jlimit(0.0f, 1.0f, eqHigh.load());
+    // Recalculate coefficients only when controls change. This removes the
+    // repeated per-block coefficient allocations during steady-state playback.
+    // A future phase will move control-change allocation off the audio thread.
+    const float lowKnob = juce::jlimit(0.0f, 1.0f, eqLow.load());
+    const float midKnob = juce::jlimit(0.0f, 1.0f, eqMid.load());
+    const float highKnob = juce::jlimit(0.0f, 1.0f, eqHigh.load());
+    const float colKnob = juce::jlimit(-1.0f, 1.0f, filterKnob.load());
 
-    auto calcGain = [](float knob) -> float {
-        if (knob <= 0.02f) return 0.0001f; // Kill (-80dB)
-        if (knob < 0.5f)
-            return juce::Decibels::decibelsToGain(juce::jmap(knob, 0.02f, 0.5f, -36.0f, 0.0f));
-        return juce::Decibels::decibelsToGain(juce::jmap(knob, 0.5f, 1.0f, 0.0f, 6.0f));
-    };
-
-    auto lowCoeffs = juce::dsp::IIR::Coefficients<float>::makeLowShelf(sampleRate, 250.0f, 0.707f, calcGain(lowKnob));
-    auto midCoeffs = juce::dsp::IIR::Coefficients<float>::makePeakFilter(sampleRate, 1000.0f, 0.8f, calcGain(midKnob));
-    auto highCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighShelf(sampleRate, 2500.0f, 0.707f, calcGain(highKnob));
-
-    // 2. Color Filter (Bipolar Knob: Left = LPF, Center = Bypass, Right = HPF)
-    float colKnob = juce::jlimit(-1.0f, 1.0f, filterKnob.load());
-    juce::ReferenceCountedObjectPtr<juce::dsp::IIR::Coefficients<float>> colCoeffs = nullptr;
-
-    if (colKnob < -0.03f)
+    if (!coefficientsValid || lowKnob != lastEqLow || midKnob != lastEqMid
+        || highKnob != lastEqHigh || colKnob != lastFilterKnob
+        || sampleRate != lastCoefficientSampleRate)
     {
-        // Low Pass Filter sweep (from 20 kHz down to 120 Hz)
-        float norm = -colKnob;
-        float cutoff = juce::jlimit(120.0f, 20000.0f, 20000.0f * std::pow(0.006f, norm));
-        colCoeffs = juce::dsp::IIR::Coefficients<float>::makeLowPass(sampleRate, cutoff, 0.85f);
+        auto calcGain = [](float knob) -> float {
+            if (knob <= 0.02f) return 0.0001f;
+            if (knob < 0.5f)
+                return juce::Decibels::decibelsToGain(juce::jmap(knob, 0.02f, 0.5f, -36.0f, 0.0f));
+            return juce::Decibels::decibelsToGain(juce::jmap(knob, 0.5f, 1.0f, 0.0f, 6.0f));
+        };
+        auto lowCoeffs = juce::dsp::IIR::Coefficients<float>::makeLowShelf(sampleRate, 250.0f, 0.707f, calcGain(lowKnob));
+        auto midCoeffs = juce::dsp::IIR::Coefficients<float>::makePeakFilter(sampleRate, 1000.0f, 0.8f, calcGain(midKnob));
+        auto highCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighShelf(sampleRate, 2500.0f, 0.707f, calcGain(highKnob));
+        juce::ReferenceCountedObjectPtr<juce::dsp::IIR::Coefficients<float>> colCoeffs;
+        if (colKnob < -0.03f)
+        {
+            const float cutoff = juce::jlimit(120.0f, 20000.0f, 20000.0f * std::pow(0.006f, -colKnob));
+            colCoeffs = juce::dsp::IIR::Coefficients<float>::makeLowPass(sampleRate, cutoff, 0.85f);
+        }
+        else if (colKnob > 0.03f)
+        {
+            const float cutoff = juce::jlimit(20.0f, 8000.0f, 20.0f * std::pow(400.0f, colKnob));
+            colCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighPass(sampleRate, cutoff, 0.85f);
+        }
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            lowFilter[ch].coefficients = lowCoeffs;
+            midFilter[ch].coefficients = midCoeffs;
+            highFilter[ch].coefficients = highCoeffs;
+            if (colCoeffs != nullptr)
+                colorFilter[ch].coefficients = colCoeffs;
+        }
+        lastEqLow = lowKnob;
+        lastEqMid = midKnob;
+        lastEqHigh = highKnob;
+        lastFilterKnob = colKnob;
+        lastCoefficientSampleRate = sampleRate;
+        coefficientsValid = true;
     }
-    else if (colKnob > 0.03f)
-    {
-        // High Pass Filter sweep (from 20 Hz up to 8000 Hz)
-        float norm = colKnob;
-        float cutoff = juce::jlimit(20.0f, 8000.0f, 20.0f * std::pow(400.0f, norm));
-        colCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighPass(sampleRate, cutoff, 0.85f);
-    }
+    const bool colorEnabled = colKnob < -0.03f || colKnob > 0.03f;
 
     int numChannels = juce::jmin(2, buffer.getNumChannels());
     for (int ch = 0; ch < numChannels; ++ch)
     {
-        lowFilter[ch].coefficients = lowCoeffs;
-        midFilter[ch].coefficients = midCoeffs;
-        highFilter[ch].coefficients = highCoeffs;
-
         auto* channelData = buffer.getWritePointer(ch);
 
-        if (colCoeffs != nullptr)
+        if (colorEnabled)
         {
-            colorFilter[ch].coefficients = colCoeffs;
             for (int i = 0; i < numSamples; ++i)
             {
                 float s = channelData[i];
