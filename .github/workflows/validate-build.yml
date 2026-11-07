@@ -1,0 +1,29 @@
+name: Validate C++ builds
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [perf/audio-engine-audit]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-15]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Compile DiscNativePro
+        run: cmake --build build --config Release --parallel 2
