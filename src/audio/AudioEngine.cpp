@@ -261,6 +261,21 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* /*inputCh
     if (outputChannelData == nullptr || numOutputChannels == 0 || numSamples <= 0)
         return;
 
+    // Device callbacks can occasionally exceed the previously announced block size.
+    // Never read/write past preallocated buffers on the real-time thread.
+    // Return silence rather than allocating or resizing in this callback.
+    if (numSamples > deck1Buffer.getNumSamples()
+        || numSamples > deck2Buffer.getNumSamples()
+        || numSamples > masterBuffer.getNumSamples()
+        || numSamples > cueBuffer.getNumSamples())
+    {
+        oversizedAudioCallbacks.fetch_add(1, std::memory_order_relaxed);
+        for (int ch = 0; ch < numOutputChannels; ++ch)
+            if (outputChannelData[ch] != nullptr)
+                std::memset(outputChannelData[ch], 0, sizeof(float) * static_cast<size_t>(numSamples));
+        return;
+    }
+
     // Ensure our internal buffers match current block samples
     deck1Buffer.clear(0, numSamples);
     deck2Buffer.clear(0, numSamples);

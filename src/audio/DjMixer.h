@@ -30,6 +30,12 @@ struct ChannelStrip
     juce::dsp::IIR::Filter<float> highFilter[2];
     juce::dsp::IIR::Filter<float> colorFilter[2];
 
+    // Cached on the audio thread; prepare() invalidates after device changes.
+    bool coefficientsValid { false };
+    float lastEqLow { 0.5f }, lastEqMid { 0.5f }, lastEqHigh { 0.5f };
+    float lastFilterKnob { 0.0f };
+    double lastCoefficientSampleRate { 0.0 };
+
     void prepare(double sampleRate, int blockSize);
     void reset();
     void process(juce::AudioBuffer<float>& buffer, int numSamples, double sampleRate);

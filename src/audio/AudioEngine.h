@@ -61,6 +61,7 @@ public:
 
     double getSampleRate() const { return currentSampleRate; }
     int getBlockSize() const     { return currentBlockSize; }
+    uint64_t getOversizedAudioCallbackCount() const { return oversizedAudioCallbacks.load(std::memory_order_relaxed); }
 
     // Audio Output Channel Routing (0 = Ch 1-2, 1 = Ch 3-4)
     void setMasterChannelPair(int pair) { masterChannelPair.store(pair); }
@@ -97,6 +98,7 @@ private:
     double currentSampleRate { 44100.0 };
     int currentBlockSize { 512 };
     std::atomic<int> currentNumOutputChannels { 2 };
+    std::atomic<uint64_t> oversizedAudioCallbacks { 0 };
     std::atomic<int> masterChannelPair { 0 }; // Pair 0 = Ch 1-2 (Master RCA on DDJ-SB2)
     std::atomic<int> cueChannelPair { 1 };    // Pair 1 = Ch 3-4 (Headphones on DDJ-SB2)
 

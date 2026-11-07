@@ -213,7 +213,9 @@ void DeckPlayer::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToF
         double step = speed * (double)N; // samples de anillo por bloque
         double oldest = (double)ringWritePos - (double)ringValid;
         double avail = revHead - oldest;
-        if (avail < 8.0 || N > scratchRingSize / 2)
+        // The reverse crossfade reads N - scratchXfade and scratchTail[0..scratchXfade).
+        // Short callbacks must not read before the output block or past the tail.
+        if (avail < 8.0 || N < scratchXfade || N > scratchRingSize / 2)
         {
             bufferToFill.clearActiveBufferRegion(); // sin historial: silencio limpio
             return;
